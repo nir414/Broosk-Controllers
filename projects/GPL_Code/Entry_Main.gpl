@@ -1,0 +1,53 @@
+'Created: 9/10/2024 12:17:50 PM
+'Reworked: 12/17/2025 (sandbox repro only)
+Module Entry_Main ' Entry_Main VER 1.0.0
+	Public Sub MAIN
+		Dim i As Integer
+		cehLog("Program start", "MAIN")
+		Console.writeline("Hello, World!")
+		' TestCode-----------------------Start
+		
+		Dim Loc1 As New Location
+		Dim Loc2 As New Location
+		Dim LocP As New Location
+
+		' Cartesian Location 좌표를 직접 지정 (원하시면 숫자만 바꿔서 사용)
+		Loc1.XYZ(4, 4, 50, 0, 0, 0)
+		Loc2.XYZ(-2, -4, 50, 0, 0, 0)
+		LocP.XYZ(-2, 6, 50, 0, 0, 0)
+		
+		Dim DPdistance As Double
+		DPdistance = point_segment_distance(Loc1, Loc2, LocP)
+		cehLog("Distance from point to segment: " & CStr(DPdistance), "MAIN")
+		' TestCode-------------------------End
+
+		cehLog("Program end", "MAIN")
+	End Sub
+	
+	' 선분(Loc1->Loc2)과 점(LocP) 사이 거리(XY 평면 기준)
+	Function point_segment_distance(Loc1 As Location, Loc2 As Location, LocP As Location) As Double
+		Dim dx As Double
+		Dim dy As Double
+		dx = Loc2.X - Loc1.X
+		dy = Loc2.Y - Loc1.Y
+		If dx = 0 And dy = 0 Then  ' A and B are the same point
+			' Z-axis distance is negligible
+			Return Math.Sqrt((LocP.X - Loc1.X) ^ 2 + (LocP.Y - Loc1.Y) ^ 2)
+		End If
+	
+		' Calculate projection parameter t, clamped between 0 and 1
+		Dim t As Double
+		t = ((LocP.X - Loc1.X) * dx + (LocP.Y - Loc1.Y) * dy) / (dx * dx + dy * dy)
+		t = Math.Max(0, Math.Min(1, t))
+		
+		' Closest point on the segment
+		Dim closest_x As Double
+		Dim closest_y As Double
+		closest_x = Loc1.X + t * dx
+		closest_y = Loc1.Y + t * dy
+		
+		' Distance to closest point
+		Return Math.Sqrt((LocP.X - closest_x) ^ 2 + (LocP.Y - closest_y) ^ 2)
+	End Function
+
+End Module

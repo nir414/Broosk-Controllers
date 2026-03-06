@@ -1,0 +1,19 @@
+'2/19/2025 5:55:47 PM
+ProjectBegin
+ProjectName="GPL_Code"
+ProjectStart="Entry_Main.MAIN"
+' Core (기본 유틸/에러 처리)
+ProjectSource="Core_SpinLock.gpl"
+ProjectSource="Core_RingQueue.gpl"
+ProjectSource="Core_ErrorHandler.gpl"
+ProjectSource="Core_Utils.gpl"
+ProjectSource="Core_StringUtils.gpl"
+ProjectSource="Core_FileStore.gpl"
+
+' Data (저장/비동기 처리)
+ProjectSource="Data_AsyncSave.gpl"
+ProjectSource="Data_DatStore.gpl"
+
+' Main (최상위, 마지막)
+ProjectSource="Entry_Main.gpl"
+ProjectEnd

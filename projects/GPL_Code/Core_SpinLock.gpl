@@ -1,0 +1,46 @@
+'Created: 12/17/2025
+'Purpose: Thread.TestAndSet(TAS) 기반 스핀락 유틸리티
+'Notes:
+' - 이 모듈은 "락 구현"만 공통화합니다.
+' - SpinLock 클래스를 사용해 데이터/임계영역별 인스턴스로 분리해서 사용합니다.
+' - 긴 임계영역(파일 I/O 등)에서는 busy-wait로 CPU를 소모할 수 있으므로 사용을 피하세요.
+Module CSL ' Core_SpinLock VER 1.0.0
+
+	'=========================
+	' Object-style spinlock
+	'=========================
+	' 용도:
+	' - 파일/채널/큐 등 "항목별" 락을 인스턴스로 분리해서 사용
+	' - 신규/개선 코드의 기본 선택지
+	' - 기존 ByRef Integer 방식과 병행 사용 가능
+	Public Class SpinLock
+		Private m_state As Integer
+
+		' 기본 생성 시 unlock(0)
+		Public Sub New()
+			m_state = 0
+		End Sub
+
+		' 락 획득 (spin + yield)
+		Public Sub Acquire()
+			While Thread.TestAndSet(m_state, 1) <> 0
+				Thread.Sleep(0)
+			End While
+		End Sub
+
+		' 락 해제
+		Public Sub Release()
+			m_state = 0
+		End Sub
+
+		' 즉시 획득 시도: 성공 1, 실패 0
+		Public Function TryAcquire() As Integer
+			If Thread.TestAndSet(m_state, 1) = 0 Then
+				TryAcquire = 1
+			Else
+				TryAcquire = 0
+			End If
+		End Function
+	End Class
+
+End Module

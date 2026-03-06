@@ -1,0 +1,273 @@
+' AsyncSave: 범용 비동기 저장 큐 (XML, DAT, JSON 등 모든 포맷 지원)
+'Requires:
+' - Core_RingQueue (RingQueue_StringPair)
+' - Core_SpinLock (in-flight/completed 상태 보호)
+' - Core_FileStore (CFS: SafeSaveFile + read/exists/restore)
+' - Core_ErrorHandler (로그/예외 기록)
+'Used by:
+' - Data_XmlStore, Data_DatStore, Entry_Main
+Module Data_AsyncSave
+
+	' 고정 크기 circular queue (ring buffer)
+	Private Const QUEUE_MAX As Integer = 64
+	Private Dim q As CRQ.RingQueue_StringPair = New CRQ.RingQueue_StringPair(QUEUE_MAX)
+
+	' worker thread 제어
+	Private Dim started As Integer ' Ensure로 1회만 시작
+	Private Dim worker As Thread = New Thread("Data_AsyncSave.WorkerFunc", , "AsyncSave")
+
+	' debug log 토글 (1=on, 0=off)
+	Private Dim debugOn As Integer
+
+	' 워커 헬스 체크용 타임스탬프
+	Private Dim lastWorkerActiveTick As Double
+
+	' Flush 신뢰성 강화용 상태
+	' - 큐가 비어도(in-memory pending=0) 워커가 "꺼내서 저장 중"인(in-flight) 작업이 있을 수 있다.
+	' - StreamWriter.Flush/Close는 실제 output이 완료될 때까지 block 하지만,
+	'   Flush()는 "워커의 I/O 완료"까지 기다려야 안전 종료 의미가 된다.
+	Private Dim inFlight As Integer
+	Private Dim inFlightLock As New CSL.SpinLock
+	Private Dim completedCount As Integer
+	Private Dim completedLock As New CSL.SpinLock
+	Private Dim lastCompletedTick As Double
+
+	' NOTE:
+	' - 큐 구현(링버퍼/락/진단)은 Core_RingQueue로 공통화합니다.
+	' - 이 모듈은 워커/파일 I/O 정책만 담당합니다.
+
+	'=========================
+	' internal: queue/state helpers
+	'=========================
+	' NOTE:
+	' - q는 선언 시점에 생성한다. (불필요한 lazy init/과보호 제거)
+
+	Private Sub SetInFlight(ByVal value As Integer)
+		inFlightLock.Acquire()
+		inFlight = value
+		inFlightLock.Release()
+	End Sub
+
+	Private Function GetInFlight() As Integer
+		inFlightLock.Acquire()
+		GetInFlight = inFlight
+		inFlightLock.Release()
+	End Function
+
+	Private Sub MarkCompleted()
+		completedLock.Acquire()
+		completedCount += 1
+		lastCompletedTick = Controller.Timer(1) * 1000
+		completedLock.Release()
+	End Sub
+
+	'=========================
+	' diagnostic helpers (public)
+	'=========================
+	' 누적 처리 완료 횟수(성공/실패/skip 포함)
+	Public Function GetCompletedCount() As Integer
+		completedLock.Acquire()
+		GetCompletedCount = completedCount
+		completedLock.Release()
+	End Function
+
+	' 마지막 완료 시각(ms) (Controller.Timer(1) 기반)
+	Public Function GetLastCompletedTick() As Double
+		completedLock.Acquire()
+		GetLastCompletedTick = lastCompletedTick
+		completedLock.Release()
+	End Function
+
+	Private Function Dequeue(ByRef path As String, ByRef xml As String) As Integer
+		Dequeue = q.TryDequeue(path, xml)
+	End Function
+
+	'=========================
+	' diagnostic / health API
+	'=========================
+	' 워커가 최근 timeoutMs(ms) 이내에 동작했는지 확인 (1=정상, 0=멈춤)
+	Public Function IsWorkerAlive(timeoutMs As Integer) As Integer
+		' Controller.Timer(1)는 초 단위(Double) 반환, timeoutMs는 ms 단위이므로 변환 필요
+		Dim nowTick As Double
+		nowTick = Controller.Timer(1) * 1000 ' 초 → ms
+		If nowTick - lastWorkerActiveTick > timeoutMs Then
+			IsWorkerAlive = 0
+		Else
+			IsWorkerAlive = 1
+		End If
+	End Function
+
+	' 큐 무결성 진단 (1=정상, 0=오염)
+	Public Function ValidateQueueIntegrity() As Integer
+		ValidateQueueIntegrity = q.ValidateIntegrity()
+	End Function
+
+	' 큐 drop(overflow) 발생 횟수 조회
+	Public Function GetDroppedCount() As Integer
+		GetDroppedCount = q.DroppedCount()
+	End Function
+
+	'=========================
+	' Public API
+	'=========================
+	' worker를 1회만 시작 (idempotent)
+	Public Sub Ensure()
+		' started는 "락"이 아니라 "1회 시작"을 보장하는 원자적 플래그입니다.
+		If Thread.TestAndSet(started, 1) = 0 Then
+			worker.Start
+		End If
+	End Sub
+
+	' debug logging on/off
+	Public Sub SetDebug(ByVal enable As Integer)
+		If enable <> 0 Then
+			debugOn = 1
+		Else
+			debugOn = 0
+		End If
+	End Sub
+
+	' enqueue; overflow 시 가장 오래된 항목 drop
+	Public Sub Enqueue(path As String, xml As String)
+		q.EnqueueDropOldest(path, xml)
+		Ensure()
+	End Sub
+
+	' try enqueue; 가득 차면 0, 성공 시 1 반환
+	Public Function TryEnqueue(path As String, xml As String) As Integer
+		TryEnqueue = q.TryEnqueue(path, xml)
+		If TryEnqueue = 1 Then
+			Ensure()
+		End If
+	End Function
+
+	' pending queue 길이 조회
+	Public Function PendingCount() As Integer
+		PendingCount = q.PendingCount()
+	End Function
+
+	' queue가 빌 때까지 대기 (timeoutMs < 0 이면 무한대기)
+	' 모두 비우면 1, 타임아웃이면 0 반환
+	Public Function Flush(ByVal timeoutMs As Integer) As Integer
+		Dim remaining As Integer
+		remaining = timeoutMs
+		While True
+			' 의미: 큐가 비었고 + 워커가 처리 중인 작업도 없을 때만 완료로 본다.
+			If PendingCount() <= 0 Then
+				If GetInFlight() = 0 Then
+					Flush = 1
+					Exit Function
+				End If
+			End If
+
+			' 방어: pending이 남아있으면 worker가 시작되어야 flush가 진행된다.
+			' (Enqueue는 Ensure를 호출하지만, shutdown/테스트 상황에서 Flush 단독 호출을 대비)
+			If PendingCount() > 0 Then
+				Ensure()
+			End If
+			If timeoutMs >= 0 Then
+				If remaining <= 0 Then
+					Flush = 0
+					Exit Function
+				End If
+				Thread.Sleep(10)
+				remaining = remaining - 10
+			Else
+				Thread.Sleep(10)
+			End If
+		End While
+	End Function
+
+	'=========================
+	'	worker thread routine (thread start entry must be Public)
+	'=========================
+	Public Sub WorkerFunc()
+		Dim p As String
+		Dim x As String
+		Dim lenX As Integer
+		Dim ex As New Exception
+		While True
+			' 워커 헬스 체크 타임스탬프 갱신 (초→ms)
+			lastWorkerActiveTick = Controller.Timer(1) * 1000
+			If Dequeue(p, x) = 1 Then
+				SetInFlight(1)
+				' 실제 file I/O 수행: CFS를 사용한 안전한 저장 (공용 파일 저장 계층)
+				Try
+					If p <> "" Then
+						Dim saveResult As Integer
+						saveResult = CFS.SafeSaveFile(p, x, 1) ' 백업 포함 저장
+						If saveResult = CFS.SAVE_SUCCESS Then
+							If debugOn = 1 Then
+								lenX = Len(x)
+								CEH.cehLog("Saved successfully | Path: " & p & " (" & CStr(lenX) & " chars)", "AsyncSave.WorkerFunc")
+							End If
+						Else
+							CEH.cehLog("Save failed | Path: " & p & " | ErrorCode: " & CStr(saveResult), "AsyncSave.WorkerFunc")
+						End If
+					Else
+						' 경로가 없으면 로그만 출력 (기존 동작)
+						If debugOn = 1 Then
+							lenX = Len(x)
+							CEH.cehLog("No path set, skipping save (" & CStr(lenX) & " chars)", "AsyncSave.WorkerFunc")
+						End If
+					End If
+				Catch ex
+					CEH.cehLogEx(ex, "AsyncSave.WorkerFunc - Exception during save | Path: " & p)
+				End Try
+				MarkCompleted()
+				SetInFlight(0)
+			Else
+				Thread.Sleep(50)
+			End If
+		End While
+	End Sub
+
+	'=========================
+	'	Sync File I/O Wrapper (계층 통합)
+	'=========================
+	' 동기 저장 (즉시 완료, 큐 사용 안함)
+	Public Function SaveSync(path As String, content As String) As Integer
+		' GPL에서는 Or가 단락평가가 아닐 수 있어 단계적으로 Nothing/Empty 체크
+		If path Is Nothing Then
+			SaveSync = CFS.SAVE_ERROR_PATH_INVALID
+			Exit Function
+		End If
+		If content Is Nothing Then
+			SaveSync = CFS.SAVE_ERROR_PATH_INVALID
+			Exit Function
+		End If
+		If path = "" Then
+			SaveSync = CFS.SAVE_ERROR_PATH_INVALID
+			Exit Function
+		End If
+		If content = "" Then
+			SaveSync = CFS.SAVE_ERROR_PATH_INVALID
+			Exit Function
+		End If
+		SaveSync = CFS.SafeSaveFile(path, content, 1)
+	End Function
+
+	' 파일 읽기 (동기)
+	Public Function ReadFile(path As String) As String
+		If path Is Nothing Then
+			ReadFile = ""
+			Exit Function
+		End If
+		If path = "" Then
+			ReadFile = ""
+			Exit Function
+		End If
+		ReadFile = CFS.ReadFileContent(path)
+	End Function
+
+	' 파일 존재 여부 확인
+	Public Function FileExists(path As String) As Integer
+		FileExists = CFS.FileExists(path)
+	End Function
+
+	' 백업에서 복구
+	Public Function RestoreFromBackup(path As String) As Integer
+		RestoreFromBackup = CFS.RestoreFromBackup(path)
+	End Function
+
+End Module

@@ -1,0 +1,230 @@
+'Created: 12/17/2025
+'Purpose: 고정 크기 링버퍼(ring buffer) 기반 큐 공통 구현
+' - Net_Tcp__CommandQueue, Data_AsyncSave 등에서 중복되던 큐 코드를 공통화
+' - Thread.TestAndSet(TAS) 기반 스핀락은 CSL 사용
+'
+'Notes:
+' - 이 모듈은 "저수준 자료구조"만 제공한다. (도메인 정책/워커/채널 로직은 각 모듈에 남긴다)
+' - fixed-size ring buffer + overflow 정책(oldest drop) + TryEnqueue(overflow reject)
+' - 진단: PendingCount / DroppedCount / ValidateIntegrity
+Module CRQ ' Core_RingQueue VER 1.0.0
+
+	'=========================
+	' RingQueue_String
+	'=========================
+	Public Class RingQueue_String
+		Private m_max As Integer
+		Private m_buf() As String
+		Private m_head As Integer
+		Private m_tail As Integer
+		Private m_count As Integer
+		Private m_dropped As Integer
+		Private m_lock As New CSL.SpinLock
+
+		Public Sub New(ByVal maxSize As Integer)
+			If maxSize <= 0 Then
+				maxSize = 1
+			End If
+			m_max = maxSize
+			ReDim m_buf(m_max - 1)
+			Reset()
+		End Sub
+
+		' Reset queue state (head/tail/count/drop)
+		Public Sub Reset()
+			m_lock.Acquire()
+			m_head = 0
+			m_tail = 0
+			m_count = 0
+			m_dropped = 0
+			m_lock.Release()
+		End Sub
+
+		Public Function PendingCount() As Integer
+			m_lock.Acquire()
+			PendingCount = m_count
+			m_lock.Release()
+		End Function
+
+		Public Function DroppedCount() As Integer
+			m_lock.Acquire()
+			DroppedCount = m_dropped
+			m_lock.Release()
+		End Function
+
+		' 1=정상, 0=오염
+		Public Function ValidateIntegrity() As Integer
+			Dim ok As Integer
+			ok = 1
+			m_lock.Acquire()
+			If m_count < 0 Or m_count > m_max Then ok = 0
+			If m_head < 0 Or m_head >= m_max Then ok = 0
+			If m_tail < 0 Or m_tail >= m_max Then ok = 0
+			If m_count = 0 And m_head <> m_tail Then ok = 0
+			m_lock.Release()
+			ValidateIntegrity = ok
+		End Function
+
+		' enqueue; overflow 시 가장 오래된 항목 drop
+		Public Sub EnqueueDropOldest(ByVal value As String)
+			If value Is Nothing Then value = ""
+			m_lock.Acquire()
+			If m_count >= m_max Then
+				m_head = (m_head + 1) Mod m_max
+				m_count = m_count - 1
+				m_dropped = m_dropped + 1
+			End If
+			m_buf(m_tail) = value
+			m_tail = (m_tail + 1) Mod m_max
+			m_count = m_count + 1
+			m_lock.Release()
+		End Sub
+
+		' try enqueue; 가득 차면 0, 성공 시 1
+		Public Function TryEnqueue(ByVal value As String) As Integer
+			If value Is Nothing Then value = ""
+			m_lock.Acquire()
+			If m_count >= m_max Then
+				m_lock.Release()
+				TryEnqueue = 0
+				Exit Function
+			End If
+			m_buf(m_tail) = value
+			m_tail = (m_tail + 1) Mod m_max
+			m_count = m_count + 1
+			m_lock.Release()
+			TryEnqueue = 1
+		End Function
+
+		' 1=성공(꺼냄), 0=없음
+		Public Function TryDequeue(ByRef value As String) As Integer
+			m_lock.Acquire()
+			If m_count <= 0 Then
+				m_lock.Release()
+				value = ""
+				TryDequeue = 0
+				Exit Function
+			End If
+			value = m_buf(m_head)
+			If value Is Nothing Then value = ""
+			m_head = (m_head + 1) Mod m_max
+			m_count = m_count - 1
+			m_lock.Release()
+			TryDequeue = 1
+		End Function
+	End Class
+
+	'=========================
+	' RingQueue_StringPair
+	'=========================
+	Public Class RingQueue_StringPair
+		Private m_max As Integer
+		Private m_a() As String
+		Private m_b() As String
+		Private m_head As Integer
+		Private m_tail As Integer
+		Private m_count As Integer
+		Private m_dropped As Integer
+		Private m_lock As New CSL.SpinLock
+
+		Public Sub New(ByVal maxSize As Integer)
+			If maxSize <= 0 Then
+				maxSize = 1
+			End If
+			m_max = maxSize
+			ReDim m_a(m_max - 1)
+			ReDim m_b(m_max - 1)
+			Reset()
+		End Sub
+
+		Public Sub Reset()
+			m_lock.Acquire()
+			m_head = 0
+			m_tail = 0
+			m_count = 0
+			m_dropped = 0
+			m_lock.Release()
+		End Sub
+
+		Public Function PendingCount() As Integer
+			m_lock.Acquire()
+			PendingCount = m_count
+			m_lock.Release()
+		End Function
+
+		Public Function DroppedCount() As Integer
+			m_lock.Acquire()
+			DroppedCount = m_dropped
+			m_lock.Release()
+		End Function
+
+		' 1=정상, 0=오염
+		Public Function ValidateIntegrity() As Integer
+			Dim ok As Integer
+			ok = 1
+			m_lock.Acquire()
+			If m_count < 0 Or m_count > m_max Then ok = 0
+			If m_head < 0 Or m_head >= m_max Then ok = 0
+			If m_tail < 0 Or m_tail >= m_max Then ok = 0
+			If m_count = 0 And m_head <> m_tail Then ok = 0
+			m_lock.Release()
+			ValidateIntegrity = ok
+		End Function
+
+		' enqueue; overflow 시 가장 오래된 항목 drop
+		Public Sub EnqueueDropOldest(ByVal a As String, ByVal b As String)
+			If a Is Nothing Then a = ""
+			If b Is Nothing Then b = ""
+			m_lock.Acquire()
+			If m_count >= m_max Then
+				m_head = (m_head + 1) Mod m_max
+				m_count = m_count - 1
+				m_dropped = m_dropped + 1
+			End If
+			m_a(m_tail) = a
+			m_b(m_tail) = b
+			m_tail = (m_tail + 1) Mod m_max
+			m_count = m_count + 1
+			m_lock.Release()
+		End Sub
+
+		' try enqueue; 가득 차면 0, 성공 시 1
+		Public Function TryEnqueue(ByVal a As String, ByVal b As String) As Integer
+			If a Is Nothing Then a = ""
+			If b Is Nothing Then b = ""
+			m_lock.Acquire()
+			If m_count >= m_max Then
+				m_lock.Release()
+				TryEnqueue = 0
+				Exit Function
+			End If
+			m_a(m_tail) = a
+			m_b(m_tail) = b
+			m_tail = (m_tail + 1) Mod m_max
+			m_count = m_count + 1
+			m_lock.Release()
+			TryEnqueue = 1
+		End Function
+
+		' 1=성공(꺼냄), 0=없음
+		Public Function TryDequeue(ByRef a As String, ByRef b As String) As Integer
+			m_lock.Acquire()
+			If m_count <= 0 Then
+				m_lock.Release()
+				a = ""
+				b = ""
+				TryDequeue = 0
+				Exit Function
+			End If
+			a = m_a(m_head)
+			b = m_b(m_head)
+			If a Is Nothing Then a = ""
+			If b Is Nothing Then b = ""
+			m_head = (m_head + 1) Mod m_max
+			m_count = m_count - 1
+			m_lock.Release()
+			TryDequeue = 1
+		End Function
+	End Class
+
+End Module

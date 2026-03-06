@@ -1,0 +1,146 @@
+' Last Update 2026/03/04 17:30
+Module CEH ' Core_ErrorHandler VER 1.0.0
+	Private Const logFilePath As String = "/ROMDISK/tmp/Robot.log"
+
+	' NOTE (sandbox):
+	' - Test_robot_sandbox는 TCP 스택 없이 단독 컴파일/실행하기 위한 폴더입니다.
+	' - 따라서 TcpCommunication 기반의 TCP 로그 포워딩은 제거합니다.
+
+
+	' 로그 파일 디렉토리가 존재하도록 보장한다.
+	Private Sub EnsureLogDirectory()
+		Dim ex As Exception
+		Dim pos As Integer
+		Dim i As Integer
+		Dim dirPath As String
+		If logFilePath Is Nothing Then Exit Sub
+		If logFilePath = "" Then Exit Sub
+		pos = 0
+		For i = 1 To Len(logFilePath)
+			If Mid(logFilePath, i, 1) = "/" Then
+				pos = i
+			End If
+		Next
+		If pos > 0 Then
+			dirPath = Mid(logFilePath, 1, pos - 1)
+			If dirPath Is Nothing Then dirPath = ""
+			If dirPath <> "" Then
+				Try
+					File.CreateDirectory(dirPath)
+				Catch ex
+					' 샌드박스는 단순 동작 우선: 디렉토리 생성 실패는 무시
+				End Try
+			End If
+		End If
+	End Sub
+
+	' 한 줄 로그를 파일에 append로 기록한다.
+	Private Sub WriteLogFile(line As String)
+		Dim ex As Exception
+		If line Is Nothing Then line = ""
+		If logFilePath Is Nothing Then Exit Sub
+		If logFilePath = "" Then Exit Sub
+		EnsureLogDirectory()
+		Try
+			Dim writer As StreamWriter
+			writer = New StreamWriter(logFilePath, True)
+			writer.WriteLine(line)
+			writer.Flush()
+			writer.Close()
+		Catch ex
+			' 샌드박스는 단순 동작 우선: 파일 기록 실패는 무시
+		End Try
+	End Sub
+
+	' (sandbox) TCP forward 제거됨
+
+	' ========================================
+	' 일반 로그 함수
+	' ========================================
+
+	' 컨텍스트를 포함한 일반 로그를 출력한다.
+	Public Sub cehLog(msg As String, context As String)
+		Dim output As String
+		If msg Is Nothing Then msg = ""
+		If context Is Nothing Then context = ""
+		If msg = "" Then Exit Sub
+		output = BuildPrefix(context) & " " & msg
+		EmitLogLine(output)
+	End Sub
+
+	' ========================================
+	' 에러 로그 함수
+	' ========================================
+
+	' 예외 코드/메시지/컨텍스트/로봇 상태를 상세 기록한다.
+	Public Sub cehLogEx(ByRef ex As Exception, ByVal context As String)
+		Dim logLine As String
+		If context Is Nothing Then context = ""
+		If ex Is Nothing Then
+			logLine = BuildPrefix("") & " ERR: (no exception object) | """ & context & """"
+			EmitLogLine(logLine)
+			Exit Sub
+		End If
+		logLine = BuildPrefix("") & " "
+		logLine = logLine & "ERR(" & CStr(ex.ErrorCode) & "): " & ex.Message()
+		logLine = logLine & " | """ & context & """"
+
+		' 로봇 오류 정보가 존재하면 부가 출력
+		If ex.RobotError Then
+			logLine = logLine & " [Robot " & CStr(ex.RobotNum) & ", Axis " & CStr(ex.Axis) & "]"
+		End If
+
+		logLine = logLine & " [SoftEStop=" & CStr(Controller.SoftEStop) & ", Power=" & CStr(Controller.PowerState) & "]"
+
+		EmitLogLine(logLine)
+	End Sub
+
+	' 로그 출력 공통 경로(콘솔 + 파일)로 전달한다.
+	Private Sub EmitLogLine(ByVal line As String)
+		If line Is Nothing Then line = ""
+		Console.WriteLine(line)
+		WriteLogFile(line)
+	End Sub
+
+	' 공통 로그 prefix([time][thread][context]) 문자열을 생성한다.
+	Private Function BuildPrefix(ByVal context As String) As String
+		Dim t As String
+		Dim th As String
+		Dim p As String
+		t = CU.timeString()
+		If t Is Nothing Then t = ""
+		th = Thread.CurrentThread.Name
+		If th Is Nothing Then th = ""
+		If context Is Nothing Then context = ""
+		p = "[" & t & "][" & th & "]"
+		If context <> "" Then
+			p = p & "[" & context & "]"
+		End If
+		Return p
+	End Function
+
+	' 일반 에러 코드를 예외로 생성하여 throw한다.
+	Public Sub cehThrow(errCode As Integer, msg As String)
+		Dim ex As New Exception
+		ex.ErrorCode = errCode
+		ex.Message = msg
+		Throw ex
+	End Sub
+
+	' 로봇 정보(번호/축)를 포함한 예외를 생성하여 throw한다.
+	Public Sub cehThrowRobot(errCode As Integer, msg As String, robotNum As Integer, axisBits As Integer)
+		Dim ex As New Exception
+		ex.ErrorCode = errCode
+		ex.Message = msg
+
+		' 로봇 오류 코드인 경우 로봇 정보 설정
+		If errCode = -1038 Then
+			ex.RobotError = True
+			ex.RobotNum = robotNum
+			ex.Axis = axisBits
+		End If
+
+		Throw ex
+	End Sub
+
+End Module

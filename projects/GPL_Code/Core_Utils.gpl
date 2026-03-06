@@ -1,0 +1,132 @@
+'Created: 9/10/2024 12:19:11 PM
+'Module: CU (was Core_Utils)
+'Purpose: 시간/문자 상수(CRLF/TAB) 및 작은 유틸 함수 모음
+'Requires:
+' - (none)
+'Used by:
+' - CEH, Net_Tcp_*, Storage_*, Data_*, Entry_Main
+Module CU ' Core_Utils VER 1.0.0
+	' 기본적인 함수나 변수들을 모아 놓은 모듈이다.
+	'
+	'=========================
+	' Public constants/time
+	'=========================
+	Public Const CR As String = Chr(13)
+	Public Const LF As String = Chr(10)
+	Public Const CRLF As String = CR & LF ' CU.CRLF
+	Public Const TAB As String = Chr(9)
+	
+	Public Function timeString() As String
+		Return Controller.PDB(121)
+		' Return Format(Controller.Timer, ".000")
+	End Function
+
+	'=========================
+	' Internal helpers (Nothing-safe)
+	'=========================
+	' GPL 런타임에서 문자열이 Nothing일 수 있고, Or/And가 단락평가를 보장하지 않을 수 있다.
+	' 따라서 문자열 입력은 먼저 정규화(= Nothing -> "") 후 처리한다.
+	Private Function NormalizeString(s As String) As String
+		If s Is Nothing Then
+			NormalizeString = ""
+		Else
+			NormalizeString = s
+		End If
+	End Function
+
+	'=========================
+	' Bit/boolean helper utils
+	'=========================
+	Public Function binToByte(binStr As String) As Byte
+		Dim s As String
+		Dim pos As Integer
+		Dim bitIndex As Integer
+		Dim ch As String
+		Dim result As Byte
+		Dim prefix As String
+		
+		s = NormalizeString(binStr)
+		s = s.Trim()
+		If s = "" Then
+			binToByte = 0
+			Exit Function
+		End If
+		
+		' 0b/0B prefix 허용 (예: "0b1010")
+		If Len(s) >= 2 Then
+			prefix = s.Substring(0, 2)
+			If prefix = "0b" Or prefix = "0B" Then
+				s = s.Substring(2)
+				s = s.Trim()
+			End If
+		End If
+		If s = "" Then
+			binToByte = 0
+			Exit Function
+		End If
+		
+		' 오른쪽(LSB)부터 최대 8비트만 파싱
+		result = 0
+		bitIndex = 0
+		For pos = Len(s) To 1 Step -1
+			If bitIndex >= 8 Then Exit For
+			ch = Mid(s, pos, 1)
+			
+			If ch = " " Then
+				' skip
+			ElseIf ch = "_" Then
+				' skip
+			ElseIf ch = "0" Then
+				bitIndex = bitIndex + 1
+			ElseIf ch = "1" Then
+				result = CByte(result + CByte(2 ^ bitIndex))
+				bitIndex = bitIndex + 1
+			Else
+				' 유효하지 않은 문자가 섞여 있으면 0 반환 (안전 우선)
+				binToByte = 0
+				Exit Function
+			End If
+		Next
+		
+		binToByte = result
+	End Function
+
+	Public Function byteToBin(value As Byte) As String
+		Dim binStr As String = ""
+		While value > 0
+			binStr = CStr(value Mod 2) & binStr
+			value \= 2
+		End While
+		If binStr = "" Then binStr = "0"
+		Return binStr
+	End Function
+
+	Public Function boolToByte(value As Boolean) As Byte
+		If value Then
+			Return 1
+		Else
+			Return 0
+		End If
+	End Function
+
+	Public Function boolArrToByte(boolArray() As Boolean) As Byte
+		Dim i As Integer
+		Dim result As Byte = 0
+		Dim limit As Integer
+		
+		If boolArray Is Nothing Then
+			boolArrToByte = 0
+			Exit Function
+		End If
+		
+		limit = boolArray.Length
+		If limit > 8 Then limit = 8
+		
+		For i = 0 To limit - 1
+			If boolArray(i) Then
+				result = CByte(result + CByte(2 ^ i))
+			End If
+		Next
+		Return result
+	End Function
+End Module

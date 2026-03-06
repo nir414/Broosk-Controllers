@@ -1,0 +1,11 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "F5: Deploy to Controller",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\tools\\controller-f5.ps1\" -ProjectKey GPL_Code -FollowRuntimeConsole"
+    }
+  ]
+}

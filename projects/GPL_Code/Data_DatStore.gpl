@@ -1,0 +1,594 @@
+' DatStore: DAT 파일 포맷 저장소 (key=value + JSON 배열 지원)
+' 
+' 설계:
+' - XmlStore와 동일한 인스턴스 기반 구조
+' - DAT 포맷: key=value (스칼라) 또는 key=[...] (JSON 배열)
+' - 배열은 CSU.ParseJsonArray로 파싱
+' - 메타데이터 자동 추적
+' - Data_AsyncSave와 통합 (파일 I/O는 AsyncSave가 CFS를 통해 처리)
+'
+'Requires:
+' - Data_AsyncSave (Enqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup)
+' - Core_StringUtils (CSU: ParseJsonArray/ParseConfigLine/StartsWith/SafeTrim)
+' - Core_ErrorHandler (CEH: 로그/예외 기록)
+'Used by:
+' - Entry_Main (예제/실사용), 기타 상위 비즈니스 로직
+
+Module Data_DatStore
+
+	Public Class DatStore
+		Private Const MAX_ITEMS As Integer = 256
+		Private keys(MAX_ITEMS-1) As String
+		Private values(MAX_ITEMS-1) As String
+		Private itemCount As Integer
+		Private m_path As String
+		Private m_lastDat As String
+		
+		' 원본 파일 구조 보존 (빈 줄, 주석, 데이터 순서 유지)
+		Private Const MAX_LINES As Integer = 500
+		Private lineTypes(MAX_LINES-1) As Integer    ' 0=빈줄, 1=메타데이터, 2=주석, 3=데이터
+		Private lineContents(MAX_LINES-1) As String  ' 원본 라인 내용
+		Private lineKeys(MAX_LINES-1) As String      ' 데이터 라인의 키
+		Private lineCount As Integer
+		
+		' 메타데이터: 저장 이력 추적
+		Private m_saveCount As Integer
+		Private m_lastSaveTime As String
+		Private m_enableMetadata As Integer = 1 ' 메타데이터 기능 활성화 (1=on, 0=off)
+		Private m_debug As Integer              ' 디버그 레벨 (0=off, 1=basic, 2=verbose)
+		Private m_dataChanged As Integer        ' 데이터 변경 플래그 (1=변경됨, 0=변경안됨)
+		Private m_lastDataSig As String         ' 마지막 로드/저장된 "일반 데이터" 시그니처
+
+		' 기본값: 메타데이터 활성화
+		Public Sub New()
+			m_lastDataSig = ""
+		End Sub
+		Public Sub New(Path As String)
+			m_path = Path
+			m_lastDataSig = ""
+		End Sub
+
+		' Path 프로퍼티
+		Public Property Path As String
+			Get
+				Path = m_path
+			End Get
+			Set(value As String)
+				m_path = value
+			End Set
+		End Property
+
+		Public Sub Reset()
+			itemCount = 0
+			lineCount = 0
+			' 데이터 초기화는 변경으로 간주 (원하면 SaveSync/Async로 파일을 비우는 저장 가능)
+			m_dataChanged = 1
+		End Sub
+		
+		Public Sub ResetMetadata()
+			m_saveCount = 0
+			m_lastSaveTime = ""
+		End Sub
+
+		' ========================================
+		' 일반 데이터 시그니처 (메타데이터 제외)
+		' - key/value의 길이 기반으로 직렬화하여 구분자 충돌을 피함
+		' - itemCount 범위만 사용
+		' ========================================
+		Private Function BuildDataSignature() As String
+			Dim sig As String
+			Dim i As Integer
+			sig = ""
+			For i = 0 To itemCount - 1
+				sig = sig & CStr(Len(keys(i))) & ":" & keys(i) & "=" & CStr(Len(values(i))) & ":" & values(i) & "|"
+			Next
+			BuildDataSignature = sig
+		End Function
+
+		' ========================================
+		' Key-Value 관리 (스칼라 + 배열 모두 지원)
+		' 중복 키 정책: 마지막 값으로 덮어쓰기 (last-write-wins)
+		' ========================================
+		Public Sub SetValue(k As String, v As String)
+			Dim i As Integer
+			' 기존 키가 있으면 값만 업데이트 (덮어쓰기)
+			For i = 0 To itemCount - 1
+				If keys(i) = k Then
+					' 기존 값과 다를 때만 변경 플래그 설정
+					If values(i) <> v Then
+						DebugLogVerbose("[DEBUG] SetValue changed | Key=" & k & " | Old=" & PreviewText(values(i), 80) & " | New=" & PreviewText(v, 80))
+						values(i) = v
+						m_dataChanged = 1
+					Else
+						DebugLogVerbose("[DEBUG] SetValue no-op (same value) | Key=" & k & " | Val=" & PreviewText(v, 80))
+					End If
+					Exit Sub
+				End If
+			Next
+			' 새 키 추가: 배열 공간 부족 시 동적 확장
+			If itemCount >= MAX_ITEMS Then
+				ReDim Preserve keys(itemCount + 50)
+				ReDim Preserve values(itemCount + 50)
+			End If
+			keys(itemCount) = k
+			values(itemCount) = v
+			itemCount += 1
+			DebugLogVerbose("[DEBUG] SetValue added | Key=" & k & " | Val=" & PreviewText(v, 80) & " | itemCount=" & CStr(itemCount))
+			m_dataChanged = 1
+		End Sub
+
+		Public Function GetValue(k As String) As String
+			Dim i As Integer
+			For i = 0 To itemCount - 1
+				If keys(i) = k Then
+					GetValue = values(i)
+					Exit Function
+				End If
+			Next
+			GetValue = ""
+		End Function
+
+		' 배열 파싱: key의 값을 JSON 배열로 해석
+		Public Function GetArrayValue(k As String, ByRef outVal() As Double) As Integer
+			Dim jsonStr As String
+			jsonStr = GetValue(k)
+			If jsonStr = "" Then
+				GetArrayValue = 0
+				Exit Function
+			End If
+			GetArrayValue = CSU.ParseJsonArray(jsonStr, outVal)
+		End Function
+
+		' ========================================
+		' 메타데이터 관리
+		' ========================================
+		Public Sub EnableMetadata(enable As Integer)
+			If enable <> 0 Then
+				m_enableMetadata = 1
+			Else
+				m_enableMetadata = 0
+			End If
+		End Sub
+		
+		Public Sub SetDebug(enable As Integer)
+			' 하위호환: 기존처럼 0/1을 넣으면 동일 동작
+			' 확장: 2 이상이면 verbose 로그
+			If enable <= 0 Then
+				m_debug = 0
+			Else
+				m_debug = enable
+			End If
+		End Sub
+		
+		Public Function GetSaveCount() As Integer
+			GetSaveCount = m_saveCount
+		End Function
+		
+		Public Function GetLastSaveTime() As String
+			GetLastSaveTime = m_lastSaveTime
+		End Function
+		
+		Private Sub DebugLog(msg As String)
+			If m_debug <> 0 Then
+				CEH.cehLog(msg, "DatStore")
+			End If
+		End Sub
+		
+		Private Sub DebugLogVerbose(msg As String)
+			If m_debug >= 2 Then
+				CEH.cehLog(msg, "DatStore")
+			End If
+		End Sub
+		
+		Private Function PreviewText(s As String, maxLen As Integer) As String
+			If maxLen <= 0 Then
+				PreviewText = ""
+				Exit Function
+			End If
+			If Len(s) <= maxLen Then
+				PreviewText = s
+			Else
+				PreviewText = Mid(s, 1, maxLen) & "...(" & CStr(Len(s)) & ")"
+			End If
+		End Function
+
+		' ========================================
+		' DAT 문자열 생성 (직렬화)
+		' ========================================
+		Public Function BuildDatString() As String
+			Dim s As String
+			Dim i As Integer
+			Dim key As String
+			Dim value As String
+			Dim alreadyWritten(MAX_ITEMS-1) As Integer
+			Dim j As Integer
+			Dim hasBlankAfterMetadata As Integer
+			Dim scanIndex As Integer
+		
+			s = ""
+		
+			' 메타데이터 먼저 기록 (활성화된 경우)
+			If m_enableMetadata = 1 Then
+				s = s & "; === Metadata ===" & CU.CRLF
+				s = s & ";_SaveCount=" & CStr(m_saveCount) & CU.CRLF
+				s = s & ";_LastSaveTime=" & m_lastSaveTime & CU.CRLF
+				
+				hasBlankAfterMetadata = 0
+				For scanIndex = 0 To lineCount - 1
+					If lineTypes(scanIndex) = 3 Then
+						Exit For
+					ElseIf lineTypes(scanIndex) = 0 Then
+						hasBlankAfterMetadata = 1
+						Exit For
+					End If
+				Next
+			
+				If hasBlankAfterMetadata = 0 And itemCount > 0 Then
+					s = s & CU.CRLF
+				End If
+			End If
+			
+			' 원본 구조 기반으로 재구성
+			For i = 0 To lineCount - 1
+				If lineTypes(i) = 0 Then
+					' 빈 줄
+					s = s & CU.CRLF
+				ElseIf lineTypes(i) = 2 Then
+					' 주석 (메타데이터 제외)
+					s = s & lineContents(i) & CU.CRLF
+				ElseIf lineTypes(i) = 3 Then
+					' 데이터: 현재 값으로 업데이트하여 출력
+					key = lineKeys(i)
+					value = GetValue(key)
+					If value <> "" Then
+						s = s & key & "=" & value & CU.CRLF
+						' 출력 완료 표시
+						For j = 0 To itemCount - 1
+							If keys(j) = key Then
+								alreadyWritten(j) = 1
+								Exit For
+							End If
+						Next
+					End If
+				End If
+				' lineTypes(i) = 1 (메타데이터)는 스킵
+			Next
+			
+			' 원본에 없던 새로운 키 추가 (파일 끝에)
+			For i = 0 To itemCount - 1
+				If alreadyWritten(i) = 0 Then
+					s = s & keys(i) & "=" & values(i) & CU.CRLF
+				End If
+			Next
+			
+			BuildDatString = s
+		End Function
+
+		' ========================================
+		' 파일 I/O (동기/비동기)
+		' ========================================
+		' SaveAsync/SaveSync 공통 준비 단계
+		' - return: 1=save 진행, 0=skip (no data change)
+		' - 주의: SaveSync는 실제 저장 성공(결과=1)일 때만 m_lastDataSig를 갱신한다.
+		Private Function PrepareSaveCommon(opName As String, ByRef curSig As String, ByRef dat As String) As Integer
+			curSig = BuildDataSignature()
+			If m_debug >= 2 Then
+				DebugLogVerbose("[DEBUG] " & opName & " signature | CurSigLen=" & CStr(Len(curSig)) & " | LastSigLen=" & CStr(Len(m_lastDataSig)))
+				DebugLogVerbose("[DEBUG] " & opName & " signature preview | Cur=" & PreviewText(curSig, 160))
+				DebugLogVerbose("[DEBUG] " & opName & " signature preview | Last=" & PreviewText(m_lastDataSig, 160))
+			End If
+			
+			' 일반 데이터가 이전 로드/저장과 동일하면 저장/메타데이터 갱신 스킵
+			If curSig = m_lastDataSig Then
+				DebugLog("[DEBUG] " & opName & " skipped (no data change) | Path=" & m_path & " | CurSigLen=" & CStr(Len(curSig)) & " | LastSigLen=" & CStr(Len(m_lastDataSig)))
+				m_dataChanged = 0
+				PrepareSaveCommon = 0
+				Exit Function
+			End If
+			DebugLog("[DEBUG] " & opName & " will save | Path=" & m_path & " | CurSigLen=" & CStr(Len(curSig)) & " | LastSigLen=" & CStr(Len(m_lastDataSig)))
+			
+			If m_enableMetadata = 1 Then
+				m_saveCount += 1
+				m_lastSaveTime = CU.timeString()
+			End If
+			
+			dat = BuildDatString()
+			DebugLogVerbose("[DEBUG] BuildDatString | Len=" & CStr(Len(dat)) & " | Head=" & PreviewText(dat, 200))
+			m_lastDat = dat
+			PrepareSaveCommon = 1
+		End Function
+
+		Public Sub SaveAsync()
+			If m_path = "" Then
+				CEH.cehLog("ERR: SaveAsync - Path not set", "DatStore")
+				Exit Sub
+			End If
+			
+			Dim curSig As String
+			Dim dat As String
+			If PrepareSaveCommon("SaveAsync", curSig, dat) = 0 Then
+				Exit Sub
+			End If
+			
+			Data_AsyncSave.Enqueue(m_path, dat)
+			DebugLog("[DEBUG] SaveAsync enqueued | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount) & " | SigLen=" & CStr(Len(curSig)) & " | DatLen=" & CStr(Len(dat)))
+			
+			' 저장 요청 완료: 현재 일반 데이터를 기준으로 스냅샷 갱신
+			m_lastDataSig = curSig
+			m_dataChanged = 0
+		End Sub
+
+		Public Function SaveSync() As Integer
+			Dim dat As String
+			Dim curSig As String
+			If m_path = "" Then
+				CEH.cehLog("ERR: SaveSync - Path not set", "DatStore")
+				SaveSync = -1
+				Exit Function
+			End If
+			
+			If PrepareSaveCommon("SaveSync", curSig, dat) = 0 Then
+				SaveSync = 1
+				Exit Function
+			End If
+			
+			SaveSync = Data_AsyncSave.SaveSync(m_path, dat)
+			DebugLog("[DEBUG] SaveSync done | Result=" & CStr(SaveSync) & " | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount) & " | SigLen=" & CStr(Len(curSig)) & " | DatLen=" & CStr(Len(dat)))
+			
+			' 저장 성공 시 플래그 리셋
+			If SaveSync = 1 Then
+				m_lastDataSig = curSig
+				m_dataChanged = 0
+			End If
+		End Function
+
+		' DAT 파일에서 로드 (동기)
+		Public Function LoadFromFile() As Integer
+			If m_path = "" Then
+				CEH.cehLog("ERR: LoadFromFile - Path not set", "DatStore")
+				LoadFromFile = 0
+				Exit Function
+			End If
+			DebugLog("[DEBUG] LoadFromFile start | Path=" & m_path)
+			
+			If Data_AsyncSave.FileExists(m_path) = 0 Then
+				CEH.cehLog("WARN: LoadFromFile - File does not exist | Path: " & m_path, "DatStore")
+				LoadFromFile = 0
+				Exit Function
+			End If
+			
+			Dim content As String
+			content = Data_AsyncSave.ReadFile(m_path)
+			DebugLogVerbose("[DEBUG] ReadFile | Len=" & CStr(Len(content)) & " | Head=" & PreviewText(content, 200))
+			
+			If content = "" Then
+				LoadFromFile = 0
+				Exit Function
+			End If
+			
+			' DAT 파싱하여 내부 배열에 로드
+			LoadFromDat(content)
+			m_lastDat = content
+			m_lastDataSig = BuildDataSignature()
+			m_dataChanged = 0  ' 로드 후에는 변경사항 없음
+			DebugLog("[DEBUG] LoadFromFile done | itemCount=" & CStr(itemCount) & " | lineCount=" & CStr(lineCount) & " | SaveCount=" & CStr(m_saveCount) & " | SigLen=" & CStr(Len(m_lastDataSig)))
+			LoadFromFile = 1
+		End Function
+
+		' DAT 문자열에서 key-value 로드 (병합 로드: 기존 데이터 유지, 동일 키는 덮어쓰기)
+		' 
+		' 파싱 전략:
+		' 1. 줄 단위 분리 후 각 라인을 명시적으로 Trim
+		' 2. 세미콜론으로 시작하면 주석 → 스킵
+		' 3. 빈 라인 → 스킵
+		' 4. key=value 형식만 SetValue로 추가
+		Private Sub LoadFromDat(datContent As String)
+			lineCount = 0
+			DebugLogVerbose("[DEBUG] LoadFromDat start | Current itemCount=" & CStr(itemCount))
+		
+			' 메타데이터 먼저 추출
+			ExtractMetadataFromDat(datContent)
+			
+			Dim lines() As String
+			Dim i As Integer
+			Dim key As String
+			Dim value As String
+			Dim trimmedLine As String
+			Dim firstChar As String
+			Dim parseResult As Integer
+			Dim ex As New Exception
+			
+			Try
+				lines = datContent.Split(CU.CRLF)
+				
+				For i = 0 To lines.Length - 1
+					trimmedLine = CSU.SafeTrim(lines(i))
+					' 선행 제어 문자 제거
+					Do While Len(trimmedLine) > 0 And (Mid(trimmedLine, 1, 1) = Chr(13) Or Mid(trimmedLine, 1, 1) = Chr(10) Or Mid(trimmedLine, 1, 1) = Chr(9) Or Mid(trimmedLine, 1, 1) = " ")
+						trimmedLine = Mid(trimmedLine, 2)
+					Loop
+					
+					' 빈 줄 기록
+					If Len(trimmedLine) = 0 Then
+						If lineCount < MAX_LINES Then
+							lineTypes(lineCount) = 0
+							lineContents(lineCount) = ""
+							lineCount += 1
+						End If
+					Else
+						firstChar = Mid(trimmedLine, 1, 1)
+						If firstChar = ";" Or firstChar = "#" Then
+							' 메타데이터 주석은 타입 1로 기록 (재출력 안 함)
+							If CSU.StartsWith(trimmedLine, ";_") = 1 Or CSU.StartsWith(trimmedLine, "; ===") = 1 Then
+								If lineCount < MAX_LINES Then
+									lineTypes(lineCount) = 1
+									lineContents(lineCount) = trimmedLine
+									lineCount += 1
+								End If
+							Else
+								' 일반 주석은 타입 2로 기록 (보존)
+								If lineCount < MAX_LINES Then
+									lineTypes(lineCount) = 2
+									lineContents(lineCount) = trimmedLine
+									lineCount += 1
+								End If
+							End If
+						Else
+							' 데이터 라인 파싱
+							parseResult = CSU.ParseConfigLine(trimmedLine, key, value)
+							
+							If m_debug = 1 Then
+								CEH.cehLog("[PARSE] Line: " & trimmedLine & " | Result: " & CStr(parseResult) & " | Key: " & key, "DatStore")
+							End If
+							
+							If parseResult = 1 Then
+								If CSU.StartsWith(key, "_") = 0 Then
+									' keys/values 배열에 저장
+									SetValue(key, value)
+									' 라인 구조 기록 (타입 3 = 데이터)
+									If lineCount < MAX_LINES Then
+										lineTypes(lineCount) = 3
+										lineContents(lineCount) = trimmedLine
+										lineKeys(lineCount) = key
+										lineCount += 1
+									End If
+								End If
+							End If
+						End If
+					End If
+				Next
+			Catch ex
+				CEH.cehLogEx(ex, "DatStore.LoadFromDat | Path: " & m_path)
+			End Try
+			DebugLogVerbose("[DEBUG] LoadFromDat done | itemCount=" & CStr(itemCount) & " | lineCount=" & CStr(lineCount))
+		End Sub
+
+		' DAT 문자열에서 메타데이터 한 줄 추출 (헬퍼 함수)
+		' metadataKey: ";_SaveCount=" 또는 ";_LastSaveTime=" 형태
+		' 반환: 해당 메타데이터 값 문자열 (찾지 못하면 "")
+		Private Function ExtractMetadataValue(datContent As String, metadataKey As String) As String
+			Dim position As Integer
+			Dim lineEnd As Integer
+			Dim valueStr As String
+			
+			position = InStr(1, datContent, metadataKey)
+			If position > 0 Then
+				' 메타데이터 키 다음 위치부터 시작
+				position = position + Len(metadataKey)
+				' 줄 끝(CRLF) 찾기
+				lineEnd = InStr(position, datContent, CU.CRLF)
+				If lineEnd = 0 Then
+					lineEnd = Len(datContent) + 1
+				End If
+				' 값 추출 및 Trim
+				valueStr = Mid(datContent, position, lineEnd - position)
+				valueStr = CSU.SafeTrim(valueStr)
+				ExtractMetadataValue = valueStr
+			Else
+				ExtractMetadataValue = ""
+			End If
+		End Function
+
+		' DAT 문자열에서 메타데이터 추출 (주석 처리된 라인에서 파싱)
+		Private Sub ExtractMetadataFromDat(datContent As String)
+			Dim saveCountStr As String
+			Dim timeStr As String
+			
+			' SaveCount 추출
+			saveCountStr = ExtractMetadataValue(datContent, ";_SaveCount=")
+			If Len(saveCountStr) > 0 Then
+				m_saveCount = CInt(saveCountStr)
+			End If
+			
+			' LastSaveTime 추출
+			timeStr = ExtractMetadataValue(datContent, ";_LastSaveTime=")
+			If Len(timeStr) > 0 Then
+				m_lastSaveTime = timeStr
+			End If
+			DebugLogVerbose("[DEBUG] Metadata extracted | SaveCount=" & CStr(m_saveCount) & " | LastSaveTime=" & m_lastSaveTime)
+			
+			' 둘 중 하나라도 있으면 메타데이터 활성화
+			If Len(saveCountStr) > 0 Or Len(timeStr) > 0 Then
+				m_enableMetadata = 1
+			End If
+		End Sub
+
+		' 백업에서 복구
+		Public Function RestoreFromBackup() As Integer
+			If m_path = "" Then
+				RestoreFromBackup = 0
+				Exit Function
+			End If
+			
+			RestoreFromBackup = Data_AsyncSave.RestoreFromBackup(m_path)
+			If RestoreFromBackup = 1 Then
+				LoadFromFile()
+			End If
+		End Function
+
+		Public Function LastDat() As String
+			LastDat = m_lastDat
+		End Function
+
+		' ========================================
+		' 디버깅용 함수 (로그 출력)
+		' ========================================
+		' 내부 배열의 모든 key-value 쌍 출력
+		Public Sub LogInternalState(label As String)
+			' 정책: SetDebug(0)일 때는 one-shot dump도 출력하지 않음 (통괄 제어)
+			If m_debug <= 0 Then
+				Exit Sub
+			End If
+
+			Dim i As Integer
+			CEH.cehLog("[DEBUG] " & label & " | itemCount=" & CStr(itemCount), "DatStore")
+			For i = 0 To itemCount - 1
+				CEH.cehLog("  [" & CStr(i) & "] " & keys(i) & " = " & values(i), "DatStore")
+			Next
+			CEH.cehLog("[DEBUG] SaveCount=" & CStr(m_saveCount) & " | LastSaveTime=" & m_lastSaveTime, "DatStore")
+		End Sub
+
+		' 배열에 중복된 키가 있는지 검사
+		Public Function HasDuplicateKeys() As Integer
+			Dim i As Integer
+			Dim j As Integer
+			For i = 0 To itemCount - 1
+				For j = i + 1 To itemCount - 1
+					If keys(i) = keys(j) Then
+						HasDuplicateKeys = 1
+						Exit Function
+					End If
+				Next
+			Next
+			HasDuplicateKeys = 0
+		End Function
+
+		' 파일 내용 전체 출력
+		Public Sub LogLastDatContent()
+			' 정책: SetDebug(0)일 때는 덤프 출력하지 않음 (통괄 제어)
+			If m_debug <= 0 Then
+				Exit Sub
+			End If
+
+			Dim lines() As String
+			Dim i As Integer
+			Dim lineCount As Integer
+			
+			lines = m_lastDat.Split(CU.CRLF)
+			lineCount = lines.Length
+			
+			CEH.cehLog("[DEBUG] LastDat Content (" & CStr(lineCount) & " lines)", "DatStore")
+			For i = 0 To lineCount - 1
+				If lines(i) <> "" Then
+					CEH.cehLog("  [Line " & CStr(i) & "] " & lines(i), "DatStore")
+				End If
+			Next
+		End Sub
+
+		' itemCount 개수 반환 (테스트용)
+		Public Function GetItemCount() As Integer
+			GetItemCount = itemCount
+		End Function
+	End Class
+
+End Module

@@ -1,0 +1,311 @@
+'Created: 2026/03/06
+'Purpose: Flash 수명을 고려한 안전한 파일 저장 관리자
+'Notes:
+' - LEGACY ModuleName(Storage_File_Manager) 대체 구현
+' - 신규/개선 코드는 CFS 모듈명을 사용
+Module CFS ' Core_FileStore VER 1.0.0
+
+	' 저장 결과 상수
+	Public Const SAVE_SUCCESS As Integer = 1
+	Public Const SAVE_ERROR_PATH_INVALID As Integer = -1
+	Public Const SAVE_ERROR_WRITE_FAILED As Integer = -2
+	Public Const SAVE_ERROR_BACKUP_FAILED As Integer = -3
+	Public Const SAVE_ERROR_TEMP_FAILED As Integer = -4
+	Public Const SAVE_ERROR_MOVE_FAILED As Integer = -5
+
+	' 파일 시스템 경로 상수
+	Public Const FLASH_PREFIX As String = "/flash/"
+	Public Const ROMDISK_PREFIX As String = "/ROMDISK/"
+	Public Const TEMP_PREFIX As String = "/ROMDISK/temp/"
+
+	'=========================
+	' Public API
+	'=========================
+	Public Function SafeSaveFile(path As String, content As String, useBackup As Integer) As Integer
+		If path Is Nothing Then
+			CEH.cehLog("ERR: Invalid path or empty content", "CFS.SafeSaveFile")
+			SafeSaveFile = SAVE_ERROR_PATH_INVALID
+			Exit Function
+		End If
+		If content Is Nothing Then
+			CEH.cehLog("ERR: Invalid path or empty content", "CFS.SafeSaveFile")
+			SafeSaveFile = SAVE_ERROR_PATH_INVALID
+			Exit Function
+		End If
+		If path = "" Then
+			CEH.cehLog("ERR: Invalid path or empty content", "CFS.SafeSaveFile")
+			SafeSaveFile = SAVE_ERROR_PATH_INVALID
+			Exit Function
+		End If
+		If content = "" Then
+			CEH.cehLog("ERR: Invalid path or empty content", "CFS.SafeSaveFile")
+			SafeSaveFile = SAVE_ERROR_PATH_INVALID
+			Exit Function
+		End If
+
+		If FileExists(path) Then
+			If IsContentIdentical(path, content) Then
+				SafeSaveFile = SAVE_SUCCESS
+				Exit Function
+			End If
+		End If
+
+		If Not EnsureDirectory(path) Then
+			SafeSaveFile = SAVE_ERROR_PATH_INVALID
+			Exit Function
+		End If
+
+		If IsFlashPath(path) Then
+			SafeSaveFile = SafeSaveToFlash(path, content, useBackup)
+		Else
+			SafeSaveFile = DirectSaveFile(path, content)
+		End If
+	End Function
+
+	Public Function SafeSaveFile(path As String, content As String) As Integer
+		SafeSaveFile = SafeSaveFile(path, content, 1)
+	End Function
+
+	Public Function FileExists(path As String) As Integer
+		Dim ex As New Exception
+		Try
+			If File.Length(path) >= 0 Then
+				FileExists = 1
+			Else
+				FileExists = 0
+			End If
+		Catch ex
+			FileExists = 0
+		End Try
+	End Function
+
+	Public Function ReadFileContent(path As String) As String
+		Dim ex As New Exception
+		Try
+			If Not FileExists(path) Then
+				ReadFileContent = ""
+				Exit Function
+			End If
+
+			Dim reader As StreamReader
+			Dim content As String
+			Dim line As String
+			Dim isFirstLine As Integer
+
+			reader = New StreamReader(path)
+			content = ""
+			isFirstLine = 1
+			Do While reader.Peek() >= 0
+				line = reader.ReadLine()
+				If isFirstLine = 1 Then
+					isFirstLine = 0
+					content = line
+				Else
+					content = content & CU.CRLF & line
+				End If
+			Loop
+			reader.Close()
+			ReadFileContent = content
+		Catch ex
+			CEH.cehLogEx(ex, "CFS.ReadFileContent | Path: " & path)
+			ReadFileContent = ""
+		End Try
+	End Function
+
+	Public Function RestoreFromBackup(path As String) As Integer
+		Dim ex As New Exception
+		Try
+			Dim backupPath As String
+			backupPath = path & ".bak"
+			If Not FileExists(backupPath) Then
+				CEH.cehLog("WARN: No backup found | Path: " & backupPath, "CFS.RestoreFromBackup")
+				RestoreFromBackup = 0
+				Exit Function
+			End If
+			File.Copy(backupPath, path)
+			CEH.cehLog("Restored from backup | Path: " & path, "CFS.RestoreFromBackup")
+			RestoreFromBackup = 1
+		Catch ex
+			CEH.cehLogEx(ex, "CFS.RestoreFromBackup | Path: " & path)
+			RestoreFromBackup = 0
+		End Try
+	End Function
+
+	Public Function DeleteFileWithBackup(path As String) As Integer
+		Dim ex As New Exception
+		Try
+			If Not FileExists(path) Then
+				DeleteFileWithBackup = 1
+				Exit Function
+			End If
+			Dim backupPath As String
+			backupPath = path & ".deleted"
+			File.Copy(path, backupPath)
+			File.DeleteFile(path)
+			CEH.cehLog("File deleted with backup | Path: " & path, "CFS.DeleteFileWithBackup")
+			DeleteFileWithBackup = 1
+		Catch ex
+			CEH.cehLogEx(ex, "CFS.DeleteFileWithBackup | Path: " & path)
+			DeleteFileWithBackup = 0
+		End Try
+	End Function
+
+	Public Sub CleanupTempFiles()
+		Dim ex As New Exception
+		Try
+			Dim files() As String
+			Dim i As Integer
+			files = File.GetFiles(TEMP_PREFIX)
+			For i = 0 To files.Length - 1
+				If Mid(files(i), Len(files(i)) - 3) = ".tmp" Then
+					File.DeleteFile(TEMP_PREFIX & files(i))
+					CEH.cehLog("Cleaned temp file | File: " & files(i), "CFS.CleanupTempFiles")
+				End If
+			Next
+		Catch ex
+			CEH.cehLogEx(ex, "CFS.CleanupTempFiles")
+		End Try
+	End Sub
+
+	Public Function IsFlashPath(path As String) As Integer
+		If Mid(path, 1, Len(FLASH_PREFIX)) = FLASH_PREFIX Then
+			IsFlashPath = 1
+		Else
+			IsFlashPath = 0
+		End If
+	End Function
+
+	'=========================
+	' Internal implementation
+	'=========================
+	Private Function SafeSaveToFlash(path As String, content As String, useBackup As Integer) As Integer
+		Dim tempPath As String
+		Dim backupPath As String
+		tempPath = GenerateTempPath(path)
+
+		If DirectSaveFile(tempPath, content) <> SAVE_SUCCESS Then
+			CEH.cehLog("ERR: Failed to write temp file | Path: " & tempPath, "CFS.SafeSaveToFlash")
+			SafeSaveToFlash = SAVE_ERROR_TEMP_FAILED
+			Exit Function
+		End If
+
+		If useBackup = 1 And FileExists(path) Then
+			backupPath = path & ".bak"
+			If Not CreateBackup(path, backupPath) Then
+				CEH.cehLog("WARN: Backup creation failed | Path: " & backupPath, "CFS.SafeSaveToFlash")
+			End If
+		End If
+
+		If Not AtomicMove(tempPath, path) Then
+			CEH.cehLog("ERR: Failed to move temp to final | Temp: " & tempPath & " -> Final: " & path, "CFS.SafeSaveToFlash")
+			SafeSaveToFlash = SAVE_ERROR_MOVE_FAILED
+			Exit Function
+		End If
+
+		CEH.cehLog("Safe save completed | Path: " & path, "CFS.SafeSaveToFlash")
+		SafeSaveToFlash = SAVE_SUCCESS
+	End Function
+
+	Private Function DirectSaveFile(path As String, content As String) As Integer
+		Dim ex As New Exception
+		Try
+			Dim writer As StreamWriter
+			writer = New StreamWriter(path)
+			writer.Write(content)
+			writer.Flush()
+			writer.Close()
+			DirectSaveFile = SAVE_SUCCESS
+		Catch ex
+			CEH.cehLogEx(ex, "CFS.DirectSaveFile | Path: " & path)
+			DirectSaveFile = SAVE_ERROR_WRITE_FAILED
+		End Try
+	End Function
+
+	Private Function IsContentIdentical(path As String, newContent As String) As Integer
+		Dim ex As New Exception
+		Try
+			Dim fileSize As Integer
+			fileSize = File.Length(path)
+			If fileSize <> Len(newContent) Then
+				IsContentIdentical = 0
+				Exit Function
+			End If
+			Dim existingContent As String
+			existingContent = ReadFileContent(path)
+			If existingContent = newContent Then
+				IsContentIdentical = 1
+			Else
+				IsContentIdentical = 0
+			End If
+		Catch ex
+			IsContentIdentical = 0
+		End Try
+	End Function
+
+	Private Function CreateBackup(originalPath As String, backupPath As String) As Integer
+		Dim ex As New Exception
+		Try
+			File.Copy(originalPath, backupPath)
+			CreateBackup = 1
+		Catch ex
+			CreateBackup = 0
+		End Try
+	End Function
+
+	Private Function AtomicMove(sourcePath As String, destPath As String) As Integer
+		Dim ex As New Exception
+		Try
+			File.Copy(sourcePath, destPath)
+			File.DeleteFile(sourcePath)
+			AtomicMove = 1
+		Catch ex
+			AtomicMove = 0
+		End Try
+	End Function
+
+	Private Function GenerateTempPath(originalPath As String) As String
+		Dim fileName As String
+		Dim pos As Integer
+		Dim i As Integer
+		pos = 0
+		For i = 1 To Len(originalPath)
+			If Mid(originalPath, i, 1) = "/" Then
+				pos = i
+			End If
+		Next
+		If pos > 0 Then
+			fileName = Mid(originalPath, pos + 1)
+		Else
+			fileName = originalPath
+		End If
+		GenerateTempPath = TEMP_PREFIX & fileName & "_" & CU.timeString() & ".tmp"
+	End Function
+
+	Private Function EnsureDirectory(filePath As String) As Integer
+		Dim ex As New Exception
+		Try
+			Dim dirPath As String
+			Dim pos As Integer
+			Dim i As Integer
+			pos = 0
+			For i = 1 To Len(filePath)
+				If Mid(filePath, i, 1) = "/" Then
+					pos = i
+				End If
+			Next
+			If pos > 0 Then
+				dirPath = Mid(filePath, 1, pos - 1)
+				File.CreateDirectory(dirPath)
+			End If
+			EnsureDirectory = 1
+		Catch ex
+			If ex.ErrorCode = -510 Then
+				EnsureDirectory = 1
+			Else
+				Console.WriteLine(CU.timeString() & " [" & Thread.CurrentThread.Name & "] ERR(" & CStr(ex.ErrorCode) & "): CFS.EnsureDirectory - " & ex.Message() & " | Path: " & filePath)
+				EnsureDirectory = 0
+			End If
+		End Try
+	End Function
+
+End Module
