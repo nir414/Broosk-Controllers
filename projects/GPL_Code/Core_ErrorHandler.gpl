@@ -1,6 +1,13 @@
 ' Last Update 2026/03/04 17:30
 Module CEH ' Core_ErrorHandler VER 1.0.0
 	Private Const logFilePath As String = "/ROMDISK/tmp/Robot.log"
+	Private Const logFlushEveryLines As Integer = 16
+	Private Dim logWriteLock As New SpinLock
+	Private Dim logDirInitLock As New SpinLock
+	Private Dim logDirInitialized As Integer
+	Private Dim logWriter As StreamWriter
+	Private Dim logWriterOpened As Integer
+	Private Dim logBufferedLineCount As Integer
 
 	' NOTE (sandbox):
 	' - Test_robot_sandbox는 TCP 스택 없이 단독 컴파일/실행하기 위한 폴더입니다.
@@ -13,8 +20,15 @@ Module CEH ' Core_ErrorHandler VER 1.0.0
 		Dim pos As Integer
 		Dim i As Integer
 		Dim dirPath As String
+		Dim ensureOk As Integer
 		If logFilePath Is Nothing Then Exit Sub
 		If logFilePath = "" Then Exit Sub
+		If logDirInitialized = 1 Then Exit Sub
+		logDirInitLock.Acquire()
+		If logDirInitialized = 1 Then
+			logDirInitLock.Release()
+			Exit Sub
+		End If
 		pos = 0
 		For i = 1 To Len(logFilePath)
 			If Mid(logFilePath, i, 1) = "/" Then
@@ -25,13 +39,61 @@ Module CEH ' Core_ErrorHandler VER 1.0.0
 			dirPath = Mid(logFilePath, 1, pos - 1)
 			If dirPath Is Nothing Then dirPath = ""
 			If dirPath <> "" Then
+				ensureOk = 1
 				Try
 					File.CreateDirectory(dirPath)
 				Catch ex
-					' 샌드박스는 단순 동작 우선: 디렉토리 생성 실패는 무시
+					If ex.ErrorCode = -510 Then
+						' 이미 존재하는 디렉토리는 정상 상태로 간주
+						ensureOk = 1
+					Else
+						ensureOk = 0
+						' 디렉토리 생성의 실제 실패만 콘솔에 남겨 관측 가능하게 한다.
+						Console.WriteLine(BuildPrefix("CEH.EnsureLogDirectory") & " ERR(" & CStr(ex.ErrorCode) & "): mkdir failed: " & ex.Message())
+					End If
 				End Try
+				If ensureOk = 1 Then
+					logDirInitialized = 1
+				End If
 			End If
+		Else
+			' 디렉토리 경로가 없는 형태면 생성 작업 없이 초기화 완료로 간주
+			logDirInitialized = 1
 		End If
+		logDirInitLock.Release()
+	End Sub
+
+	' 열려 있는 로그 writer를 종료하고 상태를 초기화한다.
+	Private Sub CloseLogWriterNoThrow()
+		Dim closeEx As Exception
+		If logWriterOpened = 1 Then
+			Try
+				logWriter.Flush()
+			Catch closeEx
+				' flush 실패는 종료 과정이므로 무시
+			End Try
+			Try
+				logWriter.Close()
+			Catch closeEx
+				' close 실패는 종료 과정이므로 무시
+			End Try
+		End If
+		logWriterOpened = 0
+		logBufferedLineCount = 0
+	End Sub
+
+	' 로그 writer를 1회만 열어 재사용한다.
+	Private Sub EnsureLogWriterOpened()
+		Dim ex As Exception
+		If logWriterOpened = 1 Then Exit Sub
+		Try
+			logWriter = New StreamWriter(logFilePath, True)
+			logWriterOpened = 1
+			logBufferedLineCount = 0
+		Catch ex
+			logWriterOpened = 0
+			Console.WriteLine(BuildPrefix("CEH.EnsureLogWriterOpened") & " ERR: open failed: " & ex.Message())
+		End Try
 	End Sub
 
 	' 한 줄 로그를 파일에 append로 기록한다.
@@ -41,15 +103,23 @@ Module CEH ' Core_ErrorHandler VER 1.0.0
 		If logFilePath Is Nothing Then Exit Sub
 		If logFilePath = "" Then Exit Sub
 		EnsureLogDirectory()
+		logWriteLock.Acquire()
 		Try
-			Dim writer As StreamWriter
-			writer = New StreamWriter(logFilePath, True)
-			writer.WriteLine(line)
-			writer.Flush()
-			writer.Close()
+			EnsureLogWriterOpened()
+			If logWriterOpened = 1 Then
+				logWriter.WriteLine(line)
+				logBufferedLineCount += 1
+				If logBufferedLineCount >= logFlushEveryLines Then
+					logWriter.Flush()
+					logBufferedLineCount = 0
+				End If
+			End If
 		Catch ex
-			' 샌드박스는 단순 동작 우선: 파일 기록 실패는 무시
+			' 파일 기록 실패를 콘솔에 남겨 관측 가능하게 한다.
+			Console.WriteLine(BuildPrefix("CEH.WriteLogFile") & " ERR: write failed: " & ex.Message())
+			CloseLogWriterNoThrow()
 		End Try
+		logWriteLock.Release()
 	End Sub
 
 	' (sandbox) TCP forward 제거됨
