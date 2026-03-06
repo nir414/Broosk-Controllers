@@ -10,7 +10,7 @@ Module Data_AsyncSave
 
 	' 고정 크기 circular queue (ring buffer)
 	Private Const QUEUE_MAX As Integer = 64
-	Private Dim q As CRQ.RingQueue_StringPair = New CRQ.RingQueue_StringPair(QUEUE_MAX)
+	Private Dim q As RingQueue_StringPair = New RingQueue_StringPair(QUEUE_MAX)
 
 	' worker thread 제어
 	Private Dim started As Integer ' Ensure로 1회만 시작
@@ -27,9 +27,9 @@ Module Data_AsyncSave
 	' - StreamWriter.Flush/Close는 실제 output이 완료될 때까지 block 하지만,
 	'   Flush()는 "워커의 I/O 완료"까지 기다려야 안전 종료 의미가 된다.
 	Private Dim inFlight As Integer
-	Private Dim inFlightLock As New CSL.SpinLock
+	Private Dim inFlightLock As New SpinLock
 	Private Dim completedCount As Integer
-	Private Dim completedLock As New CSL.SpinLock
+	Private Dim completedLock As New SpinLock
 	Private Dim lastCompletedTick As Double
 
 	' NOTE:

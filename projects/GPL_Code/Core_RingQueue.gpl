@@ -19,7 +19,7 @@ Module CRQ ' Core_RingQueue VER 1.0.0
 		Private m_tail As Integer
 		Private m_count As Integer
 		Private m_dropped As Integer
-		Private m_lock As New CSL.SpinLock
+		Private m_lock As New SpinLock
 
 		Public Sub New(ByVal maxSize As Integer)
 			If maxSize <= 0 Then
@@ -125,7 +125,7 @@ Module CRQ ' Core_RingQueue VER 1.0.0
 		Private m_tail As Integer
 		Private m_count As Integer
 		Private m_dropped As Integer
-		Private m_lock As New CSL.SpinLock
+		Private m_lock As New SpinLock
 
 		Public Sub New(ByVal maxSize As Integer)
 			If maxSize <= 0 Then
