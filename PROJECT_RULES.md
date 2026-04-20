@@ -53,6 +53,18 @@
   - 목적: 다른 언어의 `return` 관성과 혼동을 줄이고, GPL 관례를 일관되게 유지한다.
   - `Return ...`은 조기 종료가 필요한 흐름 제어 상황에서만 예외적으로 사용한다.
 
+## 7-1) For...Next 작성 규칙
+- 근거 문서
+  - [For...Next Statements](https://www2.brooksautomation.com/Controller_Software/Software_Reference/GPL_Dictionary/Statement_Dictionary/ForNext.htm)
+- 기본 원칙
+  - 반복 횟수가 명확한 경우 `Do/While`보다 `For...Next`를 우선 사용한다.
+  - 루프 제어 변수는 `Integer`를 기본으로 하며, 증감 방향이 드러나게 `Step`을 명시한다.
+  - `Next 변수명` 형태를 기본으로 사용해 가독성과 짝 매칭 안정성을 높인다.
+- 안전/가독성 규칙
+  - 루프 내부에서 제어 변수를 직접 수정하지 않는다.
+  - 조기 종료가 필요하면 `Exit For`를 사용하고, 종료 이유를 짧은 주석으로 남긴다.
+  - 중첩 루프에서는 바깥/안쪽 변수명을 의미 있게 분리한다(예: `row`, `col`).
+
 ## 8) 선언문(Declaration) 통일화 규칙
 - 근거 문서
   - [Dim Statement](https://www2.brooksautomation.com/#Controller_Software/Software_Reference/GPL_Dictionary/Statement_Dictionary/Dim.htm)

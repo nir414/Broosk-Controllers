@@ -1,0 +1,819 @@
+'Created: 2026/04/20
+'Adapted: GPL_Code architecture
+'Purpose: TCP 서버 인프라 통합 모듈
+' - TcpSession: 연결(슬롯)별 상태 캡슐화
+' - Socket I/O: 수신/송신 경로의 예외 처리/디버그/락 정책
+' - Command Handler: TCP 수신 라인(명령) 파싱/처리 결정
+' - Server Loop: accept/session/receive/line dispatch
+' - TcpCommunication: 연결 오케스트레이션 (thread per connection) + session registry
+'
+'Requires:
+' - Concurrency_SpinLock.gpl        (Module SNC): SpinLock 클래스
+' - Networking_TcpCommandQueue.gpl  (Module NCQ): 채널 큐 관리, TcpCommandQueueChannel
+' - Parsing_StringUtils.gpl         (Module PRS): SplitOnce/SafeTrim
+' - Observability_ErrorHandler.gpl  (Module OBS): 로그/예외 기록, LogSinkSub Delegate
+' - Foundation_Utils.gpl            (Module FND): CRLF, timeString
+'Used by:
+' - Orchestration_Main (TcpCommunication 인스턴스 생성/StopAll)
+'
+' 사용 예 (Orchestration_Main 등 엔트리 포인트에서):
+'   Dim tcp As New TcpCommunication("192.168.0.1", "5000")
+'   OBS.RegisterLogSink(AddressOf NET.ForwardLogLine)
+Module NET ' Networking_TcpServer VER 1.0.0
+	
+	
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''''''''' TcpSession '''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+	' TCP 연결(슬롯)별 상태 캡슐화
+	' - 병렬 배열 대신 session 객체로 상태를 묶는다.
+	
+	Public Class TcpSession
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''' PRIVATE ''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private m_id As Integer
+		Private m_ip As String
+		Private m_port As String
+		Private m_socket As Socket
+		Private m_sendLock As New SpinLock
+		Private m_echoMode As Boolean
+		Private m_queue As TcpCommandQueueChannel
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' CONSTRUCTOR ''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Sub New(ByVal id As Integer, ByVal ip As String, ByVal port As String)
+			m_id = id
+			m_ip = ip
+			m_port = port
+			m_echoMode = True
+			m_queue = Nothing
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' PROPERTIES '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Property Id As Integer
+			Get
+				Id = m_id
+			End Get
+			Set(value As Integer)
+				m_id = value
+			End Set
+		End Property
+		
+		Public Property Ip As String
+			Get
+				Ip = m_ip
+			End Get
+			Set(value As String)
+				m_ip = value
+			End Set
+		End Property
+		
+		Public Property Port As String
+			Get
+				Port = m_port
+			End Get
+			Set(value As String)
+				m_port = value
+			End Set
+		End Property
+		
+		' IMPORTANT:
+		' - Socket에 Nothing 대입 시 컨트롤러 크래시 버그가 관측된 적 있음.
+		' - Socket 참조 변경은 AttachSocket 메서드로만 수행한다.
+		Public Property Socket As Socket
+			Get
+				Socket = m_socket
+			End Get
+			Set(value As Socket)
+				If value Is Nothing Then
+					OBS.cehLog("TcpSession.Socket Set - value is Nothing (ignored)", "NET.TcpSession")
+				Else
+					m_socket = value
+				End If
+			End Set
+		End Property
+		
+		Public Sub AttachSocket(ByVal sock As Socket)
+			If sock Is Nothing Then
+				OBS.cehLog("TcpSession.AttachSocket - sock is Nothing (ignored)", "NET.TcpSession")
+				Exit Sub
+			End If
+			m_socket = sock
+		End Sub
+		
+		Public Property EchoMode As Boolean
+			Get
+				EchoMode = m_echoMode
+			End Get
+			Set(value As Boolean)
+				m_echoMode = value
+			End Set
+		End Property
+		
+		Public Property Queue As TcpCommandQueueChannel
+			Get
+				Queue = m_queue
+			End Get
+			Set(value As TcpCommandQueueChannel)
+				m_queue = value
+			End Set
+		End Property
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''' SEND '''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Sub Send(ByVal data As String)
+			SendSocket(m_socket, data, m_sendLock)
+		End Sub
+		
+		Public Sub SendLine(ByVal line As String)
+			SendSocketLine(m_socket, line, m_sendLock)
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''' CLOSE '''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Sub CloseSocket()
+			Dim ex As Exception
+			If m_socket Is Nothing Then Exit Sub
+			Try
+				m_socket.Close
+			Catch ex
+				OBS.cehLogEx(ex, "TcpSession.CloseSocket")
+			End Try
+			' NOTE: Socket에 Nothing 대입 금지 (크래시 버그 방지)
+		End Sub
+		
+	End Class
+	
+	
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''''''' Socket I/O ''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+	' TCP 소켓 I/O (Receive + Send) 경로의 예외 처리/디버그/락 정책 통합
+	' - CRLF split(라인 파싱)은 Server Loop 에서 수행한다.
+	
+	' TryReceiveOnce: TCP 소켓에서 1회 수신 시도
+	' Return:
+	'   1 = 데이터 수신 성공
+	'   0 = 연결 종료 / stop 요청 / 소켓 없음
+	'  -1 = 수신 에러
+	Public Function TryReceiveOnce(ByVal clientSocket As Socket, ByVal timeoutMs As Integer, ByVal stopping As Integer, ByVal debugOn As Integer, ByRef buf As String, ByRef ret As Integer, ByVal logContext As String) As Integer
+		Dim ex As Exception
+		
+		buf = ""
+		ret = 0
+		
+		If clientSocket Is Nothing Then
+			TryReceiveOnce = 0
+			Exit Function
+		End If
+		
+		Try
+			ret = clientSocket.Receive(buf, timeoutMs)
+			If ret <= 0 Then
+				TryReceiveOnce = 0
+				Exit Function
+			End If
+			If debugOn = 1 Then
+				OBS.cehLog("Received | Len: " & CStr(ret), logContext)
+			End If
+			TryReceiveOnce = 1
+		Catch ex
+			' stop 과정에서 socket close로 인한 예외는 정상 종료로 간주
+			If stopping <> 0 Then
+				TryReceiveOnce = 0
+				Exit Function
+			End If
+			OBS.cehLogEx(ex, logContext & " - Receive failed")
+			TryReceiveOnce = -1
+		End Try
+	End Function
+	
+	' SendSocket: 단일 Socket 대상으로 송신 (per-socket SpinLock으로 동시성 보호)
+	Public Sub SendSocket(ByVal sock As Socket, ByVal data As String, ByVal sendLock As SpinLock)
+		Dim ex As Exception
+		If sock Is Nothing Then Exit Sub
+		If data Is Nothing Then Exit Sub
+		If data = "" Then Exit Sub
+		
+		sendLock.Acquire()
+		Try
+			sock.Send(data)
+		Catch ex
+			OBS.cehLogExThrottled(ex, "NET.SendSocket | len=" & CStr(Len(data)), "NET.Send", 1000)
+		End Try
+		sendLock.Release()
+	End Sub
+	
+	' SendSocketLine: 단일 Socket 대상으로 line 송신 (CRLF 자동 추가)
+	Public Sub SendSocketLine(ByVal sock As Socket, ByVal line As String, ByVal sendLock As SpinLock)
+		If line Is Nothing Then line = ""
+		SendSocket(sock, line & FND.CRLF, sendLock)
+	End Sub
+	
+	
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	''''''''''''''''''''''' Command Handler ''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+	' TCP 수신 라인(명령) 파싱/처리 결정 로직
+	' - 네트워크/소켓 계층과 분리해 가독성/테스트 용이성 개선
+	' - 실제 송신과 큐 적재는 Server Loop 에서 수행
+	
+	' EvaluateLine: TCP 수신 line 1개를 파싱하고 처리 action 결정
+	' Input:
+	'  - line       : 수신된 명령 라인(raw)
+	'  - debugOn    : 디버그 로그 출력 여부 (1=on, 0=off)
+	'  - echoMode   : 에코 모드 상태 (ByRef, ECHO 명령으로 변경 가능)
+	' Output (ByRef):
+	'  - shouldEnqueue/enqueueText : 큐 적재 여부(1=yes, 0=no) 및 내용
+	'  - shouldEcho/echoText       : 에코 응답 여부(1=yes, 0=no) 및 내용
+	'  - replyLine1/replyLine2     : 즉시 응답 라인(최대 2개)
+	Public Sub EvaluateLine(ByVal line As String, ByVal debugOn As Integer, ByRef echoMode As Boolean, ByRef shouldEnqueue As Integer, ByRef enqueueText As String, ByRef shouldEcho As Integer, ByRef echoText As String, ByRef replyLine1 As String, ByRef replyLine2 As String)
+		Dim cmd As String
+		Dim args As String
+		Dim argsUpper As String
+		Dim left As String
+		Dim right As String
+		Dim splitOk As Integer
+		
+		' defaults
+		shouldEnqueue = 0
+		enqueueText = ""
+		shouldEcho = 0
+		echoText = ""
+		replyLine1 = ""
+		replyLine2 = ""
+		
+		If line Is Nothing Then line = ""
+		
+		' cmd/args 파싱 (첫 공백 기준)
+		splitOk = PRS.SplitOnce(line, " ", left, right)
+		If splitOk = 1 Then
+			cmd = PRS.SafeTrim(left)
+			args = PRS.SafeTrim(right)
+		Else
+			cmd = PRS.SafeTrim(line)
+			args = ""
+		End If
+		
+		' cmd는 비교용으로 대문자 정규화
+		cmd = PRS.SafeTrim(cmd)
+		If cmd <> "" Then
+			cmd = cmd.ToUpper()
+		End If
+		
+		' args 대문자 버전 (비교용)
+		argsUpper = PRS.SafeTrim(args)
+		If argsUpper <> "" Then
+			argsUpper = argsUpper.ToUpper()
+		End If
+		
+		If debugOn = 1 Then
+			OBS.cehLog("Command | " & cmd & " | Args: " & args, "NET.EvaluateLine")
+		End If
+		
+		' === Built-in commands (즉시 처리, 큐 미사용) ===
+		If cmd = "PING" Then
+			replyLine1 = "PONG"
+			Exit Sub
+		ElseIf cmd = "HELP" Then
+			replyLine1 = "OK CMDS: PING, HELP, ECHO 0|1, QUEUE <text>"
+			Exit Sub
+		ElseIf cmd = "ECHO" Then
+			If argsUpper = "1" Or argsUpper = "ON" Then
+				echoMode = True
+				replyLine1 = "OK ECHO=1"
+			ElseIf argsUpper = "0" Or argsUpper = "OFF" Then
+				echoMode = False
+				replyLine1 = "OK ECHO=0"
+			Else
+				replyLine1 = "ERR ECHO expects 0|1"
+			End If
+			Exit Sub
+		ElseIf cmd = "QUEUE" Then
+			shouldEnqueue = 1
+			enqueueText = args
+			replyLine1 = "OK QUEUED"
+			Exit Sub
+		End If
+		
+		' === Extension hook ===
+		If TryHandleCustom(cmd, args, argsUpper, line, debugOn, echoMode, shouldEnqueue, enqueueText, shouldEcho, echoText, replyLine1, replyLine2) = 1 Then
+			Exit Sub
+		End If
+		
+		' === Default 처리: 모든 미인식 명령은 큐 적재 후 ACK ===
+		If echoMode Then
+			shouldEcho = 1
+			echoText = FND.timeString() & " " & line
+		End If
+		
+		shouldEnqueue = 1
+		enqueueText = line
+		replyLine1 = "OK QUEUED"
+	End Sub
+	
+	' TryHandleCustom: 커스텀 명령 처리 훅
+	' Return: 1=handled, 0=not handled (기본 처리로 진행)
+	Public Function TryHandleCustom(ByVal cmd As String, ByVal args As String, ByVal argsUpper As String, ByVal rawLine As String, ByVal debugOn As Integer, ByRef echoMode As Boolean, ByRef shouldEnqueue As Integer, ByRef enqueueText As String, ByRef shouldEcho As Integer, ByRef echoText As String, ByRef replyLine1 As String, ByRef replyLine2 As String) As Integer
+		' Default: no custom commands
+		TryHandleCustom = 0
+	End Function
+	
+	
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	''''''''''''''''''''''''' Server Loop '''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+	' TCP server loop (accept/session/receive/line dispatch)
+	' - 상태는 호출자가 보유하고, 본 섹션은 ByRef로 전달받아 동작한다.
+	
+	' RunServerLoopForSession: session 객체를 기반으로 accept/receive/dispatch 수행
+	Public Sub RunServerLoopForSession(ByVal session As TcpSession, ByRef stopping As Integer, ByVal debugOn As Integer)
+		Dim ex As Exception
+		If session Is Nothing Then Exit Sub
+		
+		Dim endPoint As New IPEndPoint(session.Ip, session.Port)
+		Dim listener As New TcpListener(endPoint)
+		
+		Try
+			listener.Start
+		Catch ex
+			OBS.cehLogEx(ex, "NET.RunServerLoopForSession - Listener start failed")
+			Exit Sub
+		End Try
+		
+		While stopping = 0
+			Try
+				If WaitUntilPending(listener, stopping) = 0 Then Exit While
+				
+				Dim clientSocket As Socket
+				
+				If TryAcceptSocket(listener, clientSocket) = 0 Then
+					Thread.Sleep(200)
+				Else
+					HandleClientSession(session, clientSocket, stopping, debugOn)
+				End If
+			Catch ex
+				OBS.cehLogEx(ex, "NET.RunServerLoopForSession - Unhandled")
+				Thread.Sleep(200)
+			End Try
+		End While
+		
+		Try
+			listener.Stop
+			listener.Close
+		Catch ex
+			OBS.cehLogEx(ex, "NET.RunServerLoopForSession - Listener cleanup failed")
+		End Try
+	End Sub
+	
+	' client pending 상태가 될 때까지 대기하거나, stopping 요청 시 종료한다.
+	' Return: 1=continue, 0=stop
+	Private Function WaitUntilPending(ByVal listener As TcpListener, ByVal stopping As Integer) As Integer
+		WaitUntilPending = 0
+		While Not listener.Pending()
+			If stopping <> 0 Then
+				Exit Function
+			End If
+			Thread.Sleep(100)
+		End While
+		If stopping = 0 Then
+			WaitUntilPending = 1
+		End If
+	End Function
+	
+	' client socket 1개를 accept 시도한다.
+	' Return: 1=accepted, 0=failed
+	Private Function TryAcceptSocket(ByVal listener As TcpListener, ByRef clientSocket As Socket) As Integer
+		Dim ex As Exception
+		Try
+			clientSocket = listener.AcceptSocket
+			TryAcceptSocket = 1
+		Catch ex
+			OBS.cehLogEx(ex, "NET.TryAcceptSocket")
+			TryAcceptSocket = 0
+		End Try
+	End Function
+	
+	Private Sub HandleClientSession(ByVal session As TcpSession, ByVal clientSocket As Socket, ByRef stopping As Integer, ByVal debugOn As Integer)
+		Dim ex As Exception
+		If session Is Nothing Then Exit Sub
+		If clientSocket Is Nothing Then Exit Sub
+		
+		session.AttachSocket(clientSocket)
+		clientSocket.ReceiveTimeout = 0
+		clientSocket.KeepAlive = True
+		
+		OBS.cehLog("Client connected", "NET.HandleClientSession")
+		Thread.Sleep(200)
+		session.SendLine(FND.timeString() & " start(" & Thread.CurrentThread.Name & ")")
+		
+		ReceiveLoop(session, clientSocket, stopping, debugOn)
+		
+		' IMPORTANT: session.Socket = Nothing 금지 (크래시 버그 방지)
+		session.CloseSocket()
+		OBS.cehLog("Connection closed", "NET.HandleClientSession")
+	End Sub
+	
+	Private Sub ReceiveLoop(ByVal session As TcpSession, ByVal clientSocket As Socket, ByRef stopping As Integer, ByVal debugOn As Integer)
+		Dim isConnected As Integer
+		Dim recvBuf As String
+		
+		If session Is Nothing Then Exit Sub
+		If clientSocket Is Nothing Then Exit Sub
+		
+		isConnected = 1
+		recvBuf = ""
+		
+		While isConnected = 1 And stopping = 0
+			Dim buf As String
+			Dim ret As Integer
+			buf = ""
+			
+			If TryReceiveOnce(clientSocket, 2000, stopping, debugOn, buf, ret, "NET.ReceiveLoop") = 1 Then
+				recvBuf &= buf
+				ProcessRecvLines(session, recvBuf, debugOn)
+			Else
+				isConnected = 0
+			End If
+		End While
+	End Sub
+	
+	Private Sub ProcessRecvLines(ByVal session As TcpSession, ByRef recvBuf As String, ByVal debugOn As Integer)
+		Dim pos As Integer
+		Dim line As String
+		Dim trimmed As String
+		
+		If session Is Nothing Then Exit Sub
+		If recvBuf Is Nothing Then recvBuf = ""
+		
+		While True
+			pos = recvBuf.IndexOf(FND.CRLF)
+			If pos < 0 Then Exit While
+			line = recvBuf.Substring(0, pos)
+			recvBuf = recvBuf.Substring(pos + Len(FND.CRLF))
+			trimmed = PRS.SafeTrim(line)
+			If trimmed <> "" Then
+				HandleCommandLine(session, trimmed, debugOn)
+			End If
+		End While
+	End Sub
+	
+	Private Sub HandleCommandLine(ByVal session As TcpSession, ByVal line As String, ByVal debugOn As Integer)
+		Dim shouldEnqueue As Integer
+		Dim shouldEcho As Integer
+		Dim enqueueText As String
+		Dim echoText As String
+		Dim reply1 As String
+		Dim reply2 As String
+		Dim localEchoMode As Boolean
+		
+		If session Is Nothing Then Exit Sub
+		
+		localEchoMode = session.EchoMode
+		EvaluateLine(line, debugOn, localEchoMode, shouldEnqueue, enqueueText, shouldEcho, echoText, reply1, reply2)
+		session.EchoMode = localEchoMode
+		
+		If shouldEcho = 1 Then
+			session.SendLine(echoText)
+		End If
+		If shouldEnqueue = 1 Then
+			If session.Queue Is Nothing Then
+				NCQ.Enqueue(session.Id, enqueueText)
+			Else
+				session.Queue.Enqueue(enqueueText)
+			End If
+		End If
+		If reply1 <> "" Then
+			SendReply(session, reply1)
+		End If
+		If reply2 <> "" Then
+			SendReply(session, reply2)
+		End If
+	End Sub
+	
+	Private Sub SendReply(ByVal session As TcpSession, ByVal payload As String)
+		If session Is Nothing Then Exit Sub
+		If payload Is Nothing Then Exit Sub
+		If payload = "" Then Exit Sub
+		
+		If payload.IndexOf(FND.CRLF) >= 0 Then
+			Dim needTail As Integer
+			needTail = 1
+			If Len(payload) >= Len(FND.CRLF) Then
+				If payload.Substring(Len(payload) - Len(FND.CRLF)) = FND.CRLF Then
+					needTail = 0
+				End If
+			End If
+			If needTail = 1 Then
+				payload &= FND.CRLF
+			End If
+			session.Send(payload)
+		Else
+			session.SendLine(payload)
+		End If
+	End Sub
+	
+	
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''' TcpCommunication '''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+	' TCP communication orchestration (thread per connection) + session registry
+	' - 연결별 TcpSession + TcpCommandQueueChannel 자동 바인딩
+	' - OBS 로그 sink 등록으로 TCP 클라이언트에 로그 포워딩 지원
+	
+	Public Class TcpCommunication
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		''''''''''''''''''''''' SHARED STATE ''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Shared Dim sessions() As TcpSession
+		Private Shared Dim debugOn As Integer
+		Private Shared Dim stopping As Integer
+		' Shared 데이터 보호: Thread.TestAndSet 기반 (SpinLock 클래스 Shared 초기화 불확실 방지)
+		Private Shared Dim initLockState As Integer
+		Private Shared Dim TcpCount As Integer
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' INSTANCE STATE '''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Dim index As Integer
+		Private Dim m_session As TcpSession
+		Private Dim m_queue As TcpCommandQueueChannel
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''' SHARED LOCK HELPERS ''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Shared Sub AcquireInitLock()
+			While Thread.TestAndSet(initLockState, 1) <> 0
+				Thread.Sleep(0)
+			End While
+		End Sub
+		
+		Private Shared Sub ReleaseInitLock()
+			initLockState = 0
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' CONSTRUCTOR ''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Sub New(IP As String, PORT As String)
+			Dim currentCount As Integer
+			Dim session As TcpSession
+			
+			index = AllocateSlot(IP, PORT)
+			If index < 0 Then
+				OBS.cehLog("AllocateSlot failed | IP: " & IP & ", Port: " & PORT, "TcpCommunication.New")
+				Exit Sub
+			End If
+			currentCount = TcpCount
+			If TryGetSessionByIndex(index, session) = 1 Then
+				m_session = session
+				m_queue = session.Queue
+			End If
+			
+			' Thread 생성: GPL Thread.New 규칙에 따라 "ClassName.MethodName" 형식
+			Dim TcpCommunicationThread As New Thread("TcpCommunication.TcpCommunicationThreadFunc",,"TCPCOM" & CStr(currentCount))
+			TcpCommunicationThread.Argument = index
+			TcpCommunicationThread.Start
+			OBS.cehLog("Thread started | Index: " & CStr(index) & ", Count: " & CStr(currentCount) & ", IP: " & IP & ", Port: " & PORT, "TcpCommunication.New")
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' SHARED API '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Shared Function GetConnectionCount() As Integer
+			GetConnectionCount = TcpCount
+		End Function
+		
+		Public Shared Sub SetDebug(ByVal enable As Integer)
+			If enable <> 0 Then
+				debugOn = 1
+			Else
+				debugOn = 0
+			End If
+		End Sub
+		
+		Public Shared Sub Reply(ByVal sourceIndex As Integer, ByVal data As String)
+			Dim session As TcpSession
+			If TryGetSessionByIndex(sourceIndex, session) = 0 Then Exit Sub
+			session.Send(data)
+		End Sub
+		
+		Public Shared Sub ReplyLine(ByVal sourceIndex As Integer, ByVal line As String)
+			Dim session As TcpSession
+			If TryGetSessionByIndex(sourceIndex, session) = 0 Then Exit Sub
+			session.SendLine(line)
+		End Sub
+		
+		Public Shared Sub StopAll()
+			Dim ex As Exception
+			Dim i As Integer
+			Dim session As TcpSession
+			stopping = 1
+			If sessions Is Nothing Then Exit Sub
+			For i = 0 To TcpCount - 1
+				If TryGetSessionByIndex(i, session) = 1 Then
+					session.CloseSocket()
+				End If
+			Next
+		End Sub
+		
+		' BroadcastLine: 모든 활성 세션에 라인을 송신한다.
+		' - 로그 sink(ForwardLogLine)에서 사용한다.
+		Public Shared Sub BroadcastLine(ByVal line As String)
+			Dim i As Integer
+			Dim session As TcpSession
+			Dim ex As Exception
+			If sessions Is Nothing Then Exit Sub
+			If stopping <> 0 Then Exit Sub
+			For i = 0 To TcpCount - 1
+				If TryGetSessionByIndex(i, session) = 1 Then
+					Try
+						session.SendLine(line)
+					Catch ex
+						' 포워딩 실패는 무시 (best-effort)
+					End Try
+				End If
+			Next
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' INSTANCE API ''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Property Queue As TcpCommandQueueChannel
+			Get
+				If m_queue Is Nothing Then
+					If m_session Is Nothing Then
+						Dim session As TcpSession
+						If TryGetSessionByIndex(index, session) = 1 Then
+							m_session = session
+						End If
+					End If
+					If Not m_session Is Nothing Then
+						m_queue = m_session.Queue
+					End If
+					If m_queue Is Nothing Then
+						m_queue = NCQ.GetChannel(index)
+					End If
+				End If
+				Queue = m_queue
+			End Get
+			Set(value As TcpCommandQueueChannel)
+				m_queue = value
+			End Set
+		End Property
+		
+		Public Sub Send(data As String)
+			If m_session Is Nothing Then
+				Dim session As TcpSession
+				If TryGetSessionByIndex(index, session) = 0 Then Exit Sub
+				m_session = session
+			End If
+			m_session.Send(data)
+		End Sub
+		
+		Public Sub SendLine(data As String)
+			If m_session Is Nothing Then
+				Dim session As TcpSession
+				If TryGetSessionByIndex(index, session) = 0 Then Exit Sub
+				m_session = session
+			End If
+			m_session.SendLine(data)
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''' WORKER ENTRYPOINT ''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Shared Sub TcpCommunicationThreadFunc()
+			Dim ex As Exception
+			Dim slotIndex As Integer
+			Dim session As TcpSession
+			
+			' CRITICAL: 스레드 밖으로 예외가 전파되면 컨트롤러 런타임 다운 가능
+			Try
+				slotIndex = Thread.CurrentThread.Argument
+				
+				If TryGetSessionByIndex(slotIndex, session) = 0 Then
+					OBS.cehLog("Invalid slotIndex or no session: " & CStr(slotIndex), "TcpCommunication.ThreadFunc")
+					Exit Sub
+				End If
+				RunServerLoopForSession(session, stopping, debugOn)
+			Catch ex
+				OBS.cehLogEx(ex, "TcpCommunication.ThreadFunc - Unhandled")
+			End Try
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''' SESSION REGISTRY (PRIVATE) ''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Shared Function AllocateSlot(ByVal IP As String, ByVal PORT As String) As Integer
+			Dim slotIndex As Integer
+			Dim session As TcpSession
+			Dim maxChannels As Integer
+			
+			AcquireInitLock()
+			maxChannels = NCQ.MAX_CHANNELS
+			If TcpCount >= maxChannels Then
+				ReleaseInitLock()
+				OBS.cehLog("Too many connections (max=" & CStr(maxChannels) & ")", "TcpCommunication.AllocateSlot")
+				AllocateSlot = -1
+				Exit Function
+			End If
+			slotIndex = TcpCount
+			TcpCount += 1
+			
+			ReDim Preserve sessions(TcpCount)
+			session = New TcpSession(slotIndex, IP, PORT)
+			
+			NCQ.EnsureChannel(slotIndex)
+			session.Queue = NCQ.GetChannel(slotIndex)
+			
+			sessions(slotIndex) = session
+			ReleaseInitLock()
+			
+			AllocateSlot = slotIndex
+		End Function
+		
+		Private Shared Function TryGetSessionByIndex(ByVal slotIndex As Integer, ByRef session As TcpSession) As Integer
+			Dim ok As Integer
+			session = Nothing
+			If slotIndex < 0 Then
+				TryGetSessionByIndex = 0
+				Exit Function
+			End If
+			
+			ok = 1
+			AcquireInitLock()
+			If sessions Is Nothing Then
+				ok = 0
+			ElseIf slotIndex >= sessions.Length Then
+				ok = 0
+			Else
+				session = sessions(slotIndex)
+			End If
+			ReleaseInitLock()
+			
+			If ok = 0 Then
+				session = Nothing
+				TryGetSessionByIndex = 0
+				Exit Function
+			End If
+			
+			If session Is Nothing Then
+				TryGetSessionByIndex = 0
+			Else
+				TryGetSessionByIndex = 1
+			End If
+		End Function
+		
+	End Class
+	
+	
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''''' Log Sink '''''''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+	' OBS.RegisterLogSink(AddressOf NET.ForwardLogLine)으로 등록하면
+	' OBS.EmitLogLine에서 이 함수를 호출해 모든 TCP 세션에 로그를 포워딩한다.
+	Public Sub ForwardLogLine(line As String)
+		If line Is Nothing Then line = ""
+		TcpCommunication.BroadcastLine(line)
+	End Sub
+	
+End Module

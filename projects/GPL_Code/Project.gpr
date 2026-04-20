@@ -1,19 +1,26 @@
 '2/19/2025 5:55:47 PM
 ProjectBegin
 ProjectName="GPL_Code"
-ProjectStart="Entry_Main.MAIN"
-' Core (기본 유틸/에러 처리)
-ProjectSource="Core_SpinLock.gpl"
-ProjectSource="Core_RingQueue.gpl"
-ProjectSource="Core_ErrorHandler.gpl"
-ProjectSource="Core_Utils.gpl"
-ProjectSource="Core_StringUtils.gpl"
-ProjectSource="Core_FileStore.gpl"
+ProjectStart="ORCH_Main.MAIN"
 
-' Data (저장/비동기 처리)
-ProjectSource="Data_AsyncSave.gpl"
-ProjectSource="Data_DatStore.gpl"
+' Core (동기화/자료구조/유틸/로깅)
+ProjectSource="Concurrency_SpinLock.gpl"
+ProjectSource="Concurrency_RingQueue.gpl"
+ProjectSource="Observability_ErrorHandler.gpl"
+ProjectSource="Foundation_Utils.gpl"
+ProjectSource="Parsing_StringUtils.gpl"
+
+' Data (파일I/O/직렬화/저장소)
+ProjectSource="Persistence_FileStore.gpl"
+ProjectSource="Format_Apon.gpl"
+ProjectSource="Pipeline_AsyncSave.gpl"
+ProjectSource="Format_DatStore.gpl"
+
+' Networking (TCP 통신)
+ProjectSource="Networking_TcpCommandQueue.gpl"
+ProjectSource="Networking_TcpServer.gpl"
 
 ' Main (최상위, 마지막)
-ProjectSource="Entry_Main.gpl"
+ProjectSource="Orchestration_Main.gpl"
 ProjectEnd
+

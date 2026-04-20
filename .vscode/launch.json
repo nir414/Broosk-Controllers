@@ -2,10 +2,26 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "F5: Deploy to Controller",
-      "type": "node-terminal",
-      "request": "launch",
-      "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${workspaceFolder}\\tools\\controller-f5.ps1\" -ProjectKey GPL_Code -FollowRuntimeConsole"
+      "name": "GPL: F5 Upload + Debug",
+      "type": "brooks-gpl",
+      "request": "attach",
+      "controllerIp": "${config:gpl.controller.ip}",
+      "projectName": "GPL_Code",
+      "deployBeforeAttach": true,
+      "stopAllBeforeAttach": true,
+      "clearProjectBreakpointsOnAttach": false,
+      "stopOnEntry": true
+    },
+    {
+      "name": "GPL: Attach to Controller (Stop On Entry)",
+      "type": "brooks-gpl",
+      "request": "attach",
+      "controllerIp": "${config:gpl.controller.ip}",
+      "projectName": "GPL_Code",
+      "deployBeforeAttach": true,
+      "stopAllBeforeAttach": true,
+      "clearProjectBreakpointsOnAttach": true,
+      "stopOnEntry": true
     }
   ]
 }

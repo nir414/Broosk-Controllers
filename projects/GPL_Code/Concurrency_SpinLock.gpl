@@ -4,7 +4,7 @@
 ' - 이 모듈은 "락 구현"만 공통화합니다.
 ' - SpinLock 클래스를 사용해 데이터/임계영역별 인스턴스로 분리해서 사용합니다.
 ' - 긴 임계영역(파일 I/O 등)에서는 busy-wait로 CPU를 소모할 수 있으므로 사용을 피하세요.
-Module CSL ' Core_SpinLock VER 1.0.0
+Module SNC ' Concurrency_SpinLock VER 1.0.0
 
 	'=========================
 	' Object-style spinlock
@@ -44,3 +44,4 @@ Module CSL ' Core_SpinLock VER 1.0.0
 	End Class
 
 End Module
+

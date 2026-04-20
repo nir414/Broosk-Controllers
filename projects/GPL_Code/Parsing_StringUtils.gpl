@@ -7,7 +7,7 @@
 ' - Substring 범위 검사 필수 (SafeSubstring)
 ' - 공백/주석 처리 유틸로 파싱 코드 간결화
 
-Module CSU ' Core_StringUtils VER 1.0.0
+Module PRS ' Parsing_StringUtils VER 1.0.0
 
 	' ========================================
 	' [0] Internal helpers (Nothing-safe)
@@ -517,6 +517,40 @@ Module CSU ' Core_StringUtils VER 1.0.0
 	End Function
 
 	' ========================================
+	' [15] LastIndexOfChar - 특정 문자 마지막 위치
+	' ========================================
+	' 용도: 문자열에서 특정 문자의 마지막 위치(0-based)를 찾는다.
+	' 반환: 위치 (없으면 -1)
+	Public Function LastIndexOfChar(s As String, ch As String) As Integer
+		Dim pos As Integer
+		Dim lastPos As Integer
+		Dim target As String
+
+		s = NormalizeString(s)
+		ch = NormalizeString(ch)
+		If s = "" Then
+			Return -1
+		End If
+		If ch = "" Then
+			Return -1
+		End If
+
+		target = Mid(ch, 1, 1)
+		pos = s.IndexOf(target)
+		If pos < 0 Then
+			Return -1
+		End If
+
+		lastPos = pos
+		While True
+			pos = s.IndexOf(target, lastPos + 1)
+			If pos < 0 Then Exit While
+			lastPos = pos
+		End While
+		Return lastPos
+	End Function
+
+	' ========================================
 	' [16] ParseJsonArray - JSON 배열 파싱 (최적화 2-Pass)
 	' ========================================
 	' 용도: [1,2,3] 또는 [[1,2],[3,4]] 같은 JSON 배열을 1D 선형 배열로 변환
@@ -612,7 +646,7 @@ Module CSU ' Core_StringUtils VER 1.0.0
 		Dim ex As New Exception
 		
 		Try
-			Do While pos <= Len(jsonStr)
+			While pos <= Len(jsonStr)
 				ch = Mid(jsonStr, pos, 1)
 				
 				' 분기 (Select Case 미사용: GPL 구문 호환성 확보)
@@ -634,15 +668,15 @@ Module CSU ' Core_StringUtils VER 1.0.0
 					' 숫자 또는 음수 파싱
 					If (ch >= "0" And ch <= "9") Or ch = "-" Or ch = "." Then
 						numStr = ""
-						Do While pos <= Len(jsonStr)
+						While pos <= Len(jsonStr)
 							ch = Mid(jsonStr, pos, 1)
 							If (ch >= "0" And ch <= "9") Or ch = "." Or (numStr = "" And ch = "-") Then
 								numStr = numStr & ch
 								pos = pos + 1
 							Else
-								Exit Do
+								Exit While
 							End If
-						Loop
+						End While
 						
 						If numStr <> "" And numStr <> "-" Then
 							If count < outVal.Length Then
@@ -654,10 +688,11 @@ Module CSU ' Core_StringUtils VER 1.0.0
 						pos = pos + 1
 					End If
 				End If
-			Loop
+			End While
 		Catch ex
 			cehLogEx(ex, "ExtractJsonValues")
 		End Try
 	End Sub
 
 End Module
+

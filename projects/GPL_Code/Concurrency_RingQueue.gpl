@@ -1,13 +1,13 @@
 'Created: 12/17/2025
 'Purpose: 고정 크기 링버퍼(ring buffer) 기반 큐 공통 구현
-' - Net_Tcp__CommandQueue, Data_AsyncSave 등에서 중복되던 큐 코드를 공통화
-' - Thread.TestAndSet(TAS) 기반 스핀락은 CSL 사용
+' - Net_Tcp__CommandQueue, Pipeline_AsyncSave 등에서 중복되던 큐 코드를 공통화
+' - Thread.TestAndSet(TAS) 기반 스핀락은 SNC 사용
 '
 'Notes:
 ' - 이 모듈은 "저수준 자료구조"만 제공한다. (도메인 정책/워커/채널 로직은 각 모듈에 남긴다)
 ' - fixed-size ring buffer + overflow 정책(oldest drop) + TryEnqueue(overflow reject)
 ' - 진단: PendingCount / DroppedCount / ValidateIntegrity
-Module CRQ ' Core_RingQueue VER 1.0.0
+Module RNQ ' Concurrency_RingQueue VER 1.0.0
 
 	'=========================
 	' RingQueue_String
@@ -228,3 +228,4 @@ Module CRQ ' Core_RingQueue VER 1.0.0
 	End Class
 
 End Module
+

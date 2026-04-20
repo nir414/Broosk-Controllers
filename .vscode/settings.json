@@ -1,3 +1,9 @@
 {
-	"gpl.trace.server": "verbose"
+	"gpl.trace.server": "verbose",
+	"gpl.controller.ip": "192.168.0.2",
+	"gpl.controller.port": 1402,
+	"gpl.controller.consolePort": 1403,
+	"gpl.controller.timeoutMs": 10000,
+	"gpl.controller.ftpBasePath": "/GPL",
+	"gpl.controller.threadPollIntervalMs": 500
 }

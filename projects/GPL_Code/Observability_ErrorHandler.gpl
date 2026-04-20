@@ -1,0 +1,359 @@
+' Last Update 2026/03/04 17:30
+Module OBS ' Observability_ErrorHandler VER 1.0.0
+	' [의존성 모듈]
+	' - Concurrency_SpinLock.gpl   (Module SNC): SpinLock 클래스 사용
+	' - Parsing_StringUtils.gpl(Module PRS): PRS.LastIndexOfChar 사용
+	' - Foundation_Utils.gpl      (Module FND) : FND.timeString 사용
+
+	Private Const logFilePath As String = "/ROMDISK/tmp/Robot.log"
+	Private Const logFlushEveryLines As Integer = 16
+	Private Const logFlushIntervalMs As Integer = 300
+	Private Const includeThreadNameInPrefix As Integer = 0
+	Private Dim logWriteLock As New SpinLock
+	Private Dim logDirInitLock As New SpinLock
+	Private Dim logDirInitialized As Integer
+	Private Dim logWriter As StreamWriter
+	Private Dim logWriterOpened As Integer
+	Private Dim logBufferedLineCount As Integer
+	Private Dim logLastFlushMs As Double
+
+	' ========================================
+	' Delegate 기반 로그 sink (외부 모듈 확장 포인트)
+	' ========================================
+	' OBS는 sink의 구체 타입을 알 필요 없다 (의존성 역전).
+	' TCP 등 외부 모듈이 RegisterLogSink로 등록하면 EmitLogLine에서 자동 호출된다.
+	' 사용 예: OBS.RegisterLogSink(AddressOf NET.ForwardLogLine)
+	Public Delegate Sub LogSinkSub(line As String)
+	Private Const SINK_MAX As Integer = 4
+	Private Dim sinkList(SINK_MAX - 1) As LogSinkSub
+	Private Dim sinkCount As Integer
+	Private Dim emitting As Integer ' 재진입 방지 (EmitLogLine → sink → cehLog 무한루프 차단)
+
+	' ========================================
+	' Throttled 예외 로그 (고빈도 경로용)
+	' ========================================
+	' 네트워크 Send/Close 같이 정상적으로 실패가 잦은 경로에서
+	' 매번 cehLogEx를 찍으면 로그가 폭주한다.
+	' 특정 key 단위로 intervalMs마다 대표 예외 1회 + 누적 count를 기록한다.
+	Private Const THROTTLE_MAX As Integer = 16
+	Private Dim throttleLock As New SpinLock
+	Private Dim throttleKeys(THROTTLE_MAX - 1) As String
+	Private Dim throttleLastMs(THROTTLE_MAX - 1) As Double
+	Private Dim throttleCounts(THROTTLE_MAX - 1) As Integer
+
+
+	' 로그 파일 디렉토리가 존재하도록 보장한다.
+	Private Sub EnsureLogDirectory()
+		Dim ex As Exception
+		Dim pos As Integer
+		Dim dirPath As String
+		Dim ensureOk As Integer
+		If logFilePath Is Nothing Then Exit Sub
+		If logFilePath = "" Then Exit Sub
+		If logDirInitialized = 1 Then Exit Sub
+		logDirInitLock.Acquire()
+		Try
+			If logDirInitialized <> 1 Then
+				pos = PRS.LastIndexOfChar(logFilePath, "/")
+				If pos >= 0 Then
+					dirPath = logFilePath.Substring(0, pos)
+					If dirPath Is Nothing Then dirPath = ""
+					If dirPath <> "" Then
+						ensureOk = 1
+						Try
+							File.CreateDirectory(dirPath)
+						Catch ex
+							If ex.ErrorCode = -510 Then
+								' 이미 존재하는 디렉토리는 정상 상태로 간주
+								ensureOk = 1
+							Else
+								ensureOk = 0
+								' 디렉토리 생성의 실제 실패만 콘솔에 남겨 관측 가능하게 한다.
+								Console.WriteLine(BuildPrefix("OBS.EnsureLogDirectory") & " ERR(" & CStr(ex.ErrorCode) & "): mkdir failed: " & ex.Message())
+							End If
+						End Try
+						If ensureOk = 1 Then
+							logDirInitialized = 1
+						End If
+					End If
+				Else
+					' 디렉토리 경로가 없는 형태면 생성 작업 없이 초기화 완료로 간주
+					logDirInitialized = 1
+				End If
+			End If
+		Finally
+			logDirInitLock.Release()
+		End Try
+	End Sub
+
+	' 열려 있는 로그 writer를 종료하고 상태를 초기화한다.
+	Private Sub CloseLogWriterNoThrow()
+		Dim closeEx As Exception
+		If logWriterOpened = 1 Then
+			Try
+				logWriter.Flush()
+			Catch closeEx
+				' flush 실패는 종료 과정이므로 무시
+			End Try
+			Try
+				logWriter.Close()
+			Catch closeEx
+				' close 실패는 종료 과정이므로 무시
+			End Try
+		End If
+		logWriterOpened = 0
+		logBufferedLineCount = 0
+		logLastFlushMs = 0
+	End Sub
+
+	' 로그 writer를 1회만 열어 재사용한다.
+	Private Sub EnsureLogWriterOpened()
+		Dim ex As Exception
+		If logWriterOpened = 1 Then Exit Sub
+		Try
+			logWriter = New StreamWriter(logFilePath, True)
+			logWriterOpened = 1
+			logBufferedLineCount = 0
+			logLastFlushMs = Controller.Timer(1) * 1000
+		Catch ex
+			logWriterOpened = 0
+			Console.WriteLine(BuildPrefix("OBS.EnsureLogWriterOpened") & " ERR: open failed: " & ex.Message())
+		End Try
+	End Sub
+
+	' 한 줄 로그를 파일에 append로 기록한다.
+	Private Sub WriteLogFile(line As String)
+		Dim ex As Exception
+		Dim nowMs As Double
+		If line Is Nothing Then line = ""
+		If logFilePath Is Nothing Then Exit Sub
+		If logFilePath = "" Then Exit Sub
+		EnsureLogDirectory()
+		logWriteLock.Acquire()
+		Try
+			EnsureLogWriterOpened()
+			If logWriterOpened = 1 Then
+				logWriter.WriteLine(line)
+				logBufferedLineCount += 1
+				If logBufferedLineCount >= logFlushEveryLines Then
+					' 라인 카운트 도달 시 Timer 호출 없이 즉시 flush
+					logWriter.Flush()
+					logBufferedLineCount = 0
+					logLastFlushMs = Controller.Timer(1) * 1000
+				Else
+					' 라인 카운트 미달 시에만 시간 기반 flush 판단
+					nowMs = Controller.Timer(1) * 1000
+					If nowMs - logLastFlushMs >= logFlushIntervalMs Then
+						logWriter.Flush()
+						logBufferedLineCount = 0
+						logLastFlushMs = nowMs
+					End If
+				End If
+			End If
+		Catch ex
+			' 파일 기록 실패를 콘솔에 남겨 관측 가능하게 한다.
+			Console.WriteLine(BuildPrefix("OBS.WriteLogFile") & " ERR: write failed: " & ex.Message())
+			CloseLogWriterNoThrow()
+		End Try
+		logWriteLock.Release()
+	End Sub
+
+	' (sandbox) TCP forward 제거됨
+
+	' ========================================
+	' 일반 로그 함수
+	' ========================================
+
+	' 컨텍스트를 포함한 일반 로그를 출력한다.
+	Public Sub cehLog(msg As String, context As String)
+		Dim output As String
+		If msg Is Nothing Then msg = ""
+		If context Is Nothing Then context = ""
+		If msg = "" Then Exit Sub
+		output = BuildPrefix(context) & " " & msg
+		EmitLogLine(output)
+	End Sub
+
+	' ========================================
+	' 에러 로그 함수
+	' ========================================
+
+	' 예외 코드/메시지/컨텍스트/로봇 상태를 상세 기록한다.
+	Public Sub cehLogEx(ByRef ex As Exception, ByVal context As String)
+		Dim logLine As String
+		If context Is Nothing Then context = ""
+		If ex Is Nothing Then
+			logLine = BuildPrefix("") & " ERR: (no exception object) | """ & context & """"
+			EmitLogLine(logLine)
+			Exit Sub
+		End If
+		logLine = BuildPrefix("") & " "
+		logLine = logLine & "ERR(" & CStr(ex.ErrorCode) & "): " & ex.Message()
+		logLine = logLine & " | """ & context & """"
+
+		' 로봇 오류 정보가 존재하면 부가 출력
+		If ex.RobotError Then
+			logLine = logLine & " [Robot " & CStr(ex.RobotNum) & ", Axis " & CStr(ex.Axis) & "]"
+		End If
+
+		logLine = logLine & " [SoftEStop=" & CStr(Controller.SoftEStop) & ", Power=" & CStr(Controller.PowerState) & "]"
+
+		EmitLogLine(logLine)
+	End Sub
+
+	' ========================================
+	' Sink 등록 API
+	' ========================================
+
+	' 로그 sink를 등록한다. 최대 SINK_MAX개까지 등록 가능.
+	Public Sub RegisterLogSink(sink As LogSinkSub)
+		If sink Is Nothing Then Exit Sub
+		If sinkCount >= SINK_MAX Then Exit Sub
+		sinkList(sinkCount) = sink
+		sinkCount += 1
+	End Sub
+
+	' 등록된 모든 sink를 해제한다.
+	Public Sub ClearLogSinks()
+		Dim i As Integer
+		For i = 0 To SINK_MAX - 1
+			sinkList(i) = Nothing
+		Next
+		sinkCount = 0
+	End Sub
+
+	' ========================================
+	' Throttled 예외 로그 API
+	' ========================================
+
+	' key별로 intervalMs 간격마다 대표 예외 1회 + 누적 count를 기록한다.
+	Public Sub cehLogExThrottled(ByRef ex As Exception, ByVal context As String, ByVal key As String, ByVal intervalMs As Integer)
+		Dim nowMs As Double
+		Dim slot As Integer
+		Dim accumulated As Integer
+		Dim shouldLog As Integer
+
+		If intervalMs <= 0 Then intervalMs = 1000
+		If context Is Nothing Then context = ""
+		If key Is Nothing Then key = ""
+
+		nowMs = Controller.Timer(1) * 1000
+		shouldLog = 0
+
+		throttleLock.Acquire()
+		slot = FindThrottleSlot(key)
+		throttleCounts(slot) = throttleCounts(slot) + 1
+		If nowMs - throttleLastMs(slot) >= intervalMs Then
+			throttleLastMs(slot) = nowMs
+			accumulated = throttleCounts(slot)
+			throttleCounts(slot) = 0
+			shouldLog = 1
+		End If
+		throttleLock.Release()
+
+		If shouldLog = 1 Then
+			cehLogEx(ex, context & " | throttled=" & CStr(accumulated) & " | key=" & key)
+		End If
+	End Sub
+
+	' key별로 throttle slot을 찾거나 빈 slot에 할당한다.
+	Private Function FindThrottleSlot(ByVal key As String) As Integer
+		Dim i As Integer
+		Dim emptySlot As Integer
+		emptySlot = -1
+		If key Is Nothing Then key = ""
+		For i = 0 To THROTTLE_MAX - 1
+			If throttleKeys(i) Is Nothing Then
+				If emptySlot < 0 Then emptySlot = i
+			ElseIf throttleKeys(i) = key Then
+				FindThrottleSlot = i
+				Exit Function
+			End If
+		Next
+		If emptySlot >= 0 Then
+			throttleKeys(emptySlot) = key
+			throttleLastMs(emptySlot) = 0
+			throttleCounts(emptySlot) = 0
+			FindThrottleSlot = emptySlot
+		Else
+			' fallback: slot 부족 시 0번 재사용
+			throttleKeys(0) = key
+			throttleLastMs(0) = 0
+			throttleCounts(0) = 0
+			FindThrottleSlot = 0
+		End If
+	End Function
+
+	' 로그 출력 공통 경로(콘솔 + 파일 + sink)로 전달한다.
+	Private Sub EmitLogLine(ByVal line As String)
+		Dim i As Integer
+		Dim sink As LogSinkSub
+		Dim sinkEx As Exception
+		If line Is Nothing Then line = ""
+		Console.WriteLine(line)
+		WriteLogFile(line)
+		' sink 호출 (재진입 방지: sink 내부에서 cehLog 호출 시 무한루프 차단)
+		If Thread.TestAndSet(emitting, 1) = 0 Then
+			For i = 0 To sinkCount - 1
+				sink = sinkList(i)
+				If Not sink Is Nothing Then
+					Try
+						sink(line)
+					Catch sinkEx
+						' sink 실패는 콘솔에만 남기고 메인 로그 경로를 보호한다.
+						Console.WriteLine(BuildPrefix("OBS.EmitLogLine") & " WARN: sink(" & CStr(i) & ") failed: " & sinkEx.Message())
+					End Try
+				End If
+			Next
+			emitting = 0
+		End If
+	End Sub
+
+	' 공통 로그 prefix([time][thread][context]) 문자열을 생성한다.
+	Private Function BuildPrefix(ByVal context As String) As String
+		Dim t As String
+		Dim p As String
+		t = FND.timeString()
+		If t Is Nothing Then t = ""
+		If context Is Nothing Then context = ""
+		p = "[" & t & "]"
+		If includeThreadNameInPrefix = 1 Then
+			Dim th As String
+			th = Thread.CurrentThread.Name
+			If th Is Nothing Then th = ""
+			If th <> "" Then
+				p = p & "[" & th & "]"
+			End If
+		End If
+		If context <> "" Then
+			p = p & "[" & context & "]"
+		End If
+		Return p
+	End Function
+
+	' 일반 에러 코드를 예외로 생성하여 throw한다.
+	Public Sub cehThrow(errCode As Integer, msg As String)
+		Dim ex As New Exception
+		ex.ErrorCode = errCode
+		ex.Message = msg
+		Throw ex
+	End Sub
+
+	' 로봇 정보(번호/축)를 포함한 예외를 생성하여 throw한다.
+	Public Sub cehThrowRobot(errCode As Integer, msg As String, robotNum As Integer, axisBits As Integer)
+		Dim ex As New Exception
+		ex.ErrorCode = errCode
+		ex.Message = msg
+
+		' 로봇 오류 코드인 경우 로봇 정보 설정
+		If errCode = -1038 Then
+			ex.RobotError = True
+			ex.RobotNum = robotNum
+			ex.Axis = axisBits
+		End If
+
+		Throw ex
+	End Sub
+
+End Module
+

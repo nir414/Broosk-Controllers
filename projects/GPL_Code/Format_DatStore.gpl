@@ -3,18 +3,18 @@
 ' 설계:
 ' - XmlStore와 동일한 인스턴스 기반 구조
 ' - DAT 포맷: key=value (스칼라) 또는 key=[...] (JSON 배열)
-' - 배열은 CSU.ParseJsonArray로 파싱
+' - 배열은 PRS.ParseJsonArray로 파싱
 ' - 메타데이터 자동 추적
-' - Data_AsyncSave와 통합 (파일 I/O는 AsyncSave가 CFS를 통해 처리)
+' - DAS(Pipeline_AsyncSave)와 통합 (파일 I/O는 DAS가 CFS를 통해 처리)
 '
 'Requires:
-' - Data_AsyncSave (Enqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup)
-' - Core_StringUtils (CSU: ParseJsonArray/ParseConfigLine/StartsWith/SafeTrim)
-' - Core_ErrorHandler (CEH: 로그/예외 기록)
+' - DAS (Pipeline_AsyncSave: Enqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup)
+' - Parsing_StringUtils (CSU: ParseJsonArray/ParseConfigLine/StartsWith/SafeTrim)
+' - Observability_ErrorHandler (CEH: 로그/예외 기록)
 'Used by:
-' - Entry_Main (예제/실사용), 기타 상위 비즈니스 로직
+' - ORCH_Main (예제/실사용), 기타 상위 비즈니스 로직
 
-Module Data_DatStore
+Module DAT ' Format_DatStore VER 1.0.0
 
 	Public Class DatStore
 		Private Const MAX_ITEMS As Integer = 256
@@ -136,7 +136,7 @@ Module Data_DatStore
 				GetArrayValue = 0
 				Exit Function
 			End If
-			GetArrayValue = CSU.ParseJsonArray(jsonStr, outVal)
+			GetArrayValue = PRS.ParseJsonArray(jsonStr, outVal)
 		End Function
 
 		' ========================================
@@ -170,13 +170,13 @@ Module Data_DatStore
 		
 		Private Sub DebugLog(msg As String)
 			If m_debug <> 0 Then
-				CEH.cehLog(msg, "DatStore")
+				OBS.cehLog(msg, "DatStore")
 			End If
 		End Sub
 		
 		Private Sub DebugLogVerbose(msg As String)
 			If m_debug >= 2 Then
-				CEH.cehLog(msg, "DatStore")
+				OBS.cehLog(msg, "DatStore")
 			End If
 		End Sub
 		
@@ -209,9 +209,9 @@ Module Data_DatStore
 		
 			' 메타데이터 먼저 기록 (활성화된 경우)
 			If m_enableMetadata = 1 Then
-				s = s & "; === Metadata ===" & CU.CRLF
-				s = s & ";_SaveCount=" & CStr(m_saveCount) & CU.CRLF
-				s = s & ";_LastSaveTime=" & m_lastSaveTime & CU.CRLF
+				s = s & "; === Metadata ===" & FND.CRLF
+				s = s & ";_SaveCount=" & CStr(m_saveCount) & FND.CRLF
+				s = s & ";_LastSaveTime=" & m_lastSaveTime & FND.CRLF
 				
 				hasBlankAfterMetadata = 0
 				For scanIndex = 0 To lineCount - 1
@@ -224,7 +224,7 @@ Module Data_DatStore
 				Next
 			
 				If hasBlankAfterMetadata = 0 And itemCount > 0 Then
-					s = s & CU.CRLF
+					s = s & FND.CRLF
 				End If
 			End If
 			
@@ -232,16 +232,16 @@ Module Data_DatStore
 			For i = 0 To lineCount - 1
 				If lineTypes(i) = 0 Then
 					' 빈 줄
-					s = s & CU.CRLF
+					s = s & FND.CRLF
 				ElseIf lineTypes(i) = 2 Then
 					' 주석 (메타데이터 제외)
-					s = s & lineContents(i) & CU.CRLF
+					s = s & lineContents(i) & FND.CRLF
 				ElseIf lineTypes(i) = 3 Then
 					' 데이터: 현재 값으로 업데이트하여 출력
 					key = lineKeys(i)
 					value = GetValue(key)
 					If value <> "" Then
-						s = s & key & "=" & value & CU.CRLF
+						s = s & key & "=" & value & FND.CRLF
 						' 출력 완료 표시
 						For j = 0 To itemCount - 1
 							If keys(j) = key Then
@@ -257,7 +257,7 @@ Module Data_DatStore
 			' 원본에 없던 새로운 키 추가 (파일 끝에)
 			For i = 0 To itemCount - 1
 				If alreadyWritten(i) = 0 Then
-					s = s & keys(i) & "=" & values(i) & CU.CRLF
+					s = s & keys(i) & "=" & values(i) & FND.CRLF
 				End If
 			Next
 			
@@ -289,7 +289,7 @@ Module Data_DatStore
 			
 			If m_enableMetadata = 1 Then
 				m_saveCount += 1
-				m_lastSaveTime = CU.timeString()
+				m_lastSaveTime = FND.timeString()
 			End If
 			
 			dat = BuildDatString()
@@ -300,7 +300,7 @@ Module Data_DatStore
 
 		Public Sub SaveAsync()
 			If m_path = "" Then
-				CEH.cehLog("ERR: SaveAsync - Path not set", "DatStore")
+				OBS.cehLog("ERR: SaveAsync - Path not set", "DatStore")
 				Exit Sub
 			End If
 			
@@ -310,7 +310,7 @@ Module Data_DatStore
 				Exit Sub
 			End If
 			
-			Data_AsyncSave.Enqueue(m_path, dat)
+			PIP.Enqueue(m_path, dat)
 			DebugLog("[DEBUG] SaveAsync enqueued | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount) & " | SigLen=" & CStr(Len(curSig)) & " | DatLen=" & CStr(Len(dat)))
 			
 			' 저장 요청 완료: 현재 일반 데이터를 기준으로 스냅샷 갱신
@@ -322,7 +322,7 @@ Module Data_DatStore
 			Dim dat As String
 			Dim curSig As String
 			If m_path = "" Then
-				CEH.cehLog("ERR: SaveSync - Path not set", "DatStore")
+				OBS.cehLog("ERR: SaveSync - Path not set", "DatStore")
 				SaveSync = -1
 				Exit Function
 			End If
@@ -332,7 +332,7 @@ Module Data_DatStore
 				Exit Function
 			End If
 			
-			SaveSync = Data_AsyncSave.SaveSync(m_path, dat)
+			SaveSync = PIP.SaveSync(m_path, dat)
 			DebugLog("[DEBUG] SaveSync done | Result=" & CStr(SaveSync) & " | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount) & " | SigLen=" & CStr(Len(curSig)) & " | DatLen=" & CStr(Len(dat)))
 			
 			' 저장 성공 시 플래그 리셋
@@ -345,20 +345,20 @@ Module Data_DatStore
 		' DAT 파일에서 로드 (동기)
 		Public Function LoadFromFile() As Integer
 			If m_path = "" Then
-				CEH.cehLog("ERR: LoadFromFile - Path not set", "DatStore")
+				OBS.cehLog("ERR: LoadFromFile - Path not set", "DatStore")
 				LoadFromFile = 0
 				Exit Function
 			End If
 			DebugLog("[DEBUG] LoadFromFile start | Path=" & m_path)
 			
-			If Data_AsyncSave.FileExists(m_path) = 0 Then
-				CEH.cehLog("WARN: LoadFromFile - File does not exist | Path: " & m_path, "DatStore")
+			If PIP.FileExists(m_path) = 0 Then
+				OBS.cehLog("WARN: LoadFromFile - File does not exist | Path: " & m_path, "DatStore")
 				LoadFromFile = 0
 				Exit Function
 			End If
 			
 			Dim content As String
-			content = Data_AsyncSave.ReadFile(m_path)
+			content = PIP.ReadFile(m_path)
 			DebugLogVerbose("[DEBUG] ReadFile | Len=" & CStr(Len(content)) & " | Head=" & PreviewText(content, 200))
 			
 			If content = "" Then
@@ -399,10 +399,10 @@ Module Data_DatStore
 			Dim ex As New Exception
 			
 			Try
-				lines = datContent.Split(CU.CRLF)
+				lines = datContent.Split(FND.CRLF)
 				
 				For i = 0 To lines.Length - 1
-					trimmedLine = CSU.SafeTrim(lines(i))
+					trimmedLine = PRS.SafeTrim(lines(i))
 					' 선행 제어 문자 제거
 					Do While Len(trimmedLine) > 0 And (Mid(trimmedLine, 1, 1) = Chr(13) Or Mid(trimmedLine, 1, 1) = Chr(10) Or Mid(trimmedLine, 1, 1) = Chr(9) Or Mid(trimmedLine, 1, 1) = " ")
 						trimmedLine = Mid(trimmedLine, 2)
@@ -419,7 +419,7 @@ Module Data_DatStore
 						firstChar = Mid(trimmedLine, 1, 1)
 						If firstChar = ";" Or firstChar = "#" Then
 							' 메타데이터 주석은 타입 1로 기록 (재출력 안 함)
-							If CSU.StartsWith(trimmedLine, ";_") = 1 Or CSU.StartsWith(trimmedLine, "; ===") = 1 Then
+							If PRS.StartsWith(trimmedLine, ";_") = 1 Or PRS.StartsWith(trimmedLine, "; ===") = 1 Then
 								If lineCount < MAX_LINES Then
 									lineTypes(lineCount) = 1
 									lineContents(lineCount) = trimmedLine
@@ -435,14 +435,14 @@ Module Data_DatStore
 							End If
 						Else
 							' 데이터 라인 파싱
-							parseResult = CSU.ParseConfigLine(trimmedLine, key, value)
+							parseResult = PRS.ParseConfigLine(trimmedLine, key, value)
 							
 							If m_debug = 1 Then
-								CEH.cehLog("[PARSE] Line: " & trimmedLine & " | Result: " & CStr(parseResult) & " | Key: " & key, "DatStore")
+								OBS.cehLog("[PARSE] Line: " & trimmedLine & " | Result: " & CStr(parseResult) & " | Key: " & key, "DatStore")
 							End If
 							
 							If parseResult = 1 Then
-								If CSU.StartsWith(key, "_") = 0 Then
+								If PRS.StartsWith(key, "_") = 0 Then
 									' keys/values 배열에 저장
 									SetValue(key, value)
 									' 라인 구조 기록 (타입 3 = 데이터)
@@ -458,7 +458,7 @@ Module Data_DatStore
 					End If
 				Next
 			Catch ex
-				CEH.cehLogEx(ex, "DatStore.LoadFromDat | Path: " & m_path)
+				OBS.cehLogEx(ex, "DatStore.LoadFromDat | Path: " & m_path)
 			End Try
 			DebugLogVerbose("[DEBUG] LoadFromDat done | itemCount=" & CStr(itemCount) & " | lineCount=" & CStr(lineCount))
 		End Sub
@@ -476,13 +476,13 @@ Module Data_DatStore
 				' 메타데이터 키 다음 위치부터 시작
 				position = position + Len(metadataKey)
 				' 줄 끝(CRLF) 찾기
-				lineEnd = InStr(position, datContent, CU.CRLF)
+				lineEnd = InStr(position, datContent, FND.CRLF)
 				If lineEnd = 0 Then
 					lineEnd = Len(datContent) + 1
 				End If
 				' 값 추출 및 Trim
 				valueStr = Mid(datContent, position, lineEnd - position)
-				valueStr = CSU.SafeTrim(valueStr)
+				valueStr = PRS.SafeTrim(valueStr)
 				ExtractMetadataValue = valueStr
 			Else
 				ExtractMetadataValue = ""
@@ -520,7 +520,7 @@ Module Data_DatStore
 				Exit Function
 			End If
 			
-			RestoreFromBackup = Data_AsyncSave.RestoreFromBackup(m_path)
+			RestoreFromBackup = PIP.RestoreFromBackup(m_path)
 			If RestoreFromBackup = 1 Then
 				LoadFromFile()
 			End If
@@ -541,11 +541,11 @@ Module Data_DatStore
 			End If
 
 			Dim i As Integer
-			CEH.cehLog("[DEBUG] " & label & " | itemCount=" & CStr(itemCount), "DatStore")
+			OBS.cehLog("[DEBUG] " & label & " | itemCount=" & CStr(itemCount), "DatStore")
 			For i = 0 To itemCount - 1
-				CEH.cehLog("  [" & CStr(i) & "] " & keys(i) & " = " & values(i), "DatStore")
+				OBS.cehLog("  [" & CStr(i) & "] " & keys(i) & " = " & values(i), "DatStore")
 			Next
-			CEH.cehLog("[DEBUG] SaveCount=" & CStr(m_saveCount) & " | LastSaveTime=" & m_lastSaveTime, "DatStore")
+			OBS.cehLog("[DEBUG] SaveCount=" & CStr(m_saveCount) & " | LastSaveTime=" & m_lastSaveTime, "DatStore")
 		End Sub
 
 		' 배열에 중복된 키가 있는지 검사
@@ -574,13 +574,13 @@ Module Data_DatStore
 			Dim i As Integer
 			Dim lineCount As Integer
 			
-			lines = m_lastDat.Split(CU.CRLF)
+			lines = m_lastDat.Split(FND.CRLF)
 			lineCount = lines.Length
 			
-			CEH.cehLog("[DEBUG] LastDat Content (" & CStr(lineCount) & " lines)", "DatStore")
+			OBS.cehLog("[DEBUG] LastDat Content (" & CStr(lineCount) & " lines)", "DatStore")
 			For i = 0 To lineCount - 1
 				If lines(i) <> "" Then
-					CEH.cehLog("  [Line " & CStr(i) & "] " & lines(i), "DatStore")
+					OBS.cehLog("  [Line " & CStr(i) & "] " & lines(i), "DatStore")
 				End If
 			Next
 		End Sub
@@ -592,3 +592,4 @@ Module Data_DatStore
 	End Class
 
 End Module
+

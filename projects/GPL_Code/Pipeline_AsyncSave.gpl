@@ -1,20 +1,23 @@
 ' AsyncSave: 범용 비동기 저장 큐 (XML, DAT, JSON 등 모든 포맷 지원)
 'Requires:
-' - Core_RingQueue (RingQueue_StringPair)
-' - Core_SpinLock (in-flight/completed 상태 보호)
+' - Concurrency_RingQueue (RingQueue_StringPair)
+' - Concurrency_SpinLock (in-flight/completed 상태 보호)
 ' - Core_FileStore (CFS: SafeSaveFile + read/exists/restore)
-' - Core_ErrorHandler (로그/예외 기록)
+' - Observability_ErrorHandler (로그/예외 기록)
 'Used by:
-' - Data_XmlStore, Data_DatStore, Entry_Main
-Module Data_AsyncSave
+' - DAT(Format_DatStore), ORCH_Main
+Module PIP ' Pipeline_AsyncSave VER 1.0.0
 
 	' 고정 크기 circular queue (ring buffer)
 	Private Const QUEUE_MAX As Integer = 64
 	Private Dim q As RingQueue_StringPair = New RingQueue_StringPair(QUEUE_MAX)
 
-	' worker thread 제어
+	' dispatcher thread 제어
 	Private Dim started As Integer ' Ensure로 1회만 시작
-	Private Dim worker As Thread = New Thread("Data_AsyncSave.WorkerFunc", , "AsyncSave")
+
+	' 동적 스레드 이름 생성용 카운터
+	Private Dim threadIdCounter As Integer
+	Private Dim threadIdLock As New SpinLock
 
 	' debug log 토글 (1=on, 0=off)
 	Private Dim debugOn As Integer
@@ -33,7 +36,7 @@ Module Data_AsyncSave
 	Private Dim lastCompletedTick As Double
 
 	' NOTE:
-	' - 큐 구현(링버퍼/락/진단)은 Core_RingQueue로 공통화합니다.
+	' - 큐 구현(링버퍼/락/진단)은 Concurrency_RingQueue로 공통화합니다.
 	' - 이 모듈은 워커/파일 I/O 정책만 담당합니다.
 
 	'=========================
@@ -42,9 +45,17 @@ Module Data_AsyncSave
 	' NOTE:
 	' - q는 선언 시점에 생성한다. (불필요한 lazy init/과보호 제거)
 
-	Private Sub SetInFlight(ByVal value As Integer)
+	Private Sub IncrementInFlight()
 		inFlightLock.Acquire()
-		inFlight = value
+		inFlight = inFlight + 1
+		inFlightLock.Release()
+	End Sub
+
+	Private Sub DecrementInFlight()
+		inFlightLock.Acquire()
+		If inFlight > 0 Then
+			inFlight = inFlight - 1
+		End If
 		inFlightLock.Release()
 	End Sub
 
@@ -110,13 +121,21 @@ Module Data_AsyncSave
 	'=========================
 	' Public API
 	'=========================
-	' worker를 1회만 시작 (idempotent)
+	' dispatcher를 1회만 시작 (idempotent)
 	Public Sub Ensure()
-		' started는 "락"이 아니라 "1회 시작"을 보장하는 원자적 플래그입니다.
 		If Thread.TestAndSet(started, 1) = 0 Then
-			worker.Start
+			Dim d As New Thread("PIP.DispatcherFunc", , "AsyncSaveDispatch")
+			d.Start
 		End If
 	End Sub
+
+	' 동적 스레드용 고유 ID 발급
+	Private Function NextThreadId() As Integer
+		threadIdLock.Acquire()
+		threadIdCounter = threadIdCounter + 1
+		NextThreadId = threadIdCounter
+		threadIdLock.Release()
+	End Function
 
 	' debug logging on/off
 	Public Sub SetDebug(ByVal enable As Integer)
@@ -179,47 +198,54 @@ Module Data_AsyncSave
 	End Function
 
 	'=========================
-	'	worker thread routine (thread start entry must be Public)
+	'	Dispatcher: 큐 감시 → pending 수만큼 워커 스레드 동적 생성
 	'=========================
-	Public Sub WorkerFunc()
+	Public Sub DispatcherFunc()
+		Dim pending As Integer
+		Dim i As Integer
+		Dim t As Thread
+		While True
+			lastWorkerActiveTick = Controller.Timer(1) * 1000
+			pending = PendingCount()
+			If pending > 0 Then
+				For i = 1 To pending
+					IncrementInFlight()
+					t = New Thread("PIP.OneOffWorker", , "Save" & CStr(NextThreadId()))
+					t.Start
+				Next
+			End If
+			Thread.Sleep(20)
+		End While
+	End Sub
+
+	'=========================
+	'	1회성 워커: dequeue → save → 종료
+	'=========================
+	Public Sub OneOffWorker()
 		Dim p As String
 		Dim x As String
 		Dim lenX As Integer
 		Dim ex As New Exception
-		While True
-			' 워커 헬스 체크 타임스탬프 갱신 (초→ms)
-			lastWorkerActiveTick = Controller.Timer(1) * 1000
-			If Dequeue(p, x) = 1 Then
-				SetInFlight(1)
-				' 실제 file I/O 수행: CFS를 사용한 안전한 저장 (공용 파일 저장 계층)
-				Try
-					If p <> "" Then
-						Dim saveResult As Integer
-						saveResult = CFS.SafeSaveFile(p, x, 1) ' 백업 포함 저장
-						If saveResult = CFS.SAVE_SUCCESS Then
-							If debugOn = 1 Then
-								lenX = Len(x)
-								CEH.cehLog("Saved successfully | Path: " & p & " (" & CStr(lenX) & " chars)", "AsyncSave.WorkerFunc")
-							End If
-						Else
-							CEH.cehLog("Save failed | Path: " & p & " | ErrorCode: " & CStr(saveResult), "AsyncSave.WorkerFunc")
-						End If
-					Else
-						' 경로가 없으면 로그만 출력 (기존 동작)
+		If Dequeue(p, x) = 1 Then
+			Try
+				If p <> "" Then
+					Dim saveResult As Integer
+					saveResult = PST.SafeSaveFile(p, x, 1) ' 백업 포함 저장
+					If saveResult = PST.SAVE_SUCCESS Then
 						If debugOn = 1 Then
 							lenX = Len(x)
-							CEH.cehLog("No path set, skipping save (" & CStr(lenX) & " chars)", "AsyncSave.WorkerFunc")
+							OBS.cehLog("Saved | " & p & " (" & CStr(lenX) & "c)", "AsyncSave.Worker")
 						End If
+					Else
+						OBS.cehLog("Save failed | " & p & " | Err:" & CStr(saveResult), "AsyncSave.Worker")
 					End If
-				Catch ex
-					CEH.cehLogEx(ex, "AsyncSave.WorkerFunc - Exception during save | Path: " & p)
-				End Try
-				MarkCompleted()
-				SetInFlight(0)
-			Else
-				Thread.Sleep(50)
-			End If
-		End While
+				End If
+			Catch ex
+				OBS.cehLogEx(ex, "AsyncSave.Worker | " & p)
+			End Try
+			MarkCompleted()
+		End If
+		DecrementInFlight()
 	End Sub
 
 	'=========================
@@ -229,22 +255,22 @@ Module Data_AsyncSave
 	Public Function SaveSync(path As String, content As String) As Integer
 		' GPL에서는 Or가 단락평가가 아닐 수 있어 단계적으로 Nothing/Empty 체크
 		If path Is Nothing Then
-			SaveSync = CFS.SAVE_ERROR_PATH_INVALID
+			SaveSync = PST.SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
 		If content Is Nothing Then
-			SaveSync = CFS.SAVE_ERROR_PATH_INVALID
+			SaveSync = PST.SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
 		If path = "" Then
-			SaveSync = CFS.SAVE_ERROR_PATH_INVALID
+			SaveSync = PST.SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
 		If content = "" Then
-			SaveSync = CFS.SAVE_ERROR_PATH_INVALID
+			SaveSync = PST.SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
-		SaveSync = CFS.SafeSaveFile(path, content, 1)
+		SaveSync = PST.SafeSaveFile(path, content, 1)
 	End Function
 
 	' 파일 읽기 (동기)
@@ -257,17 +283,18 @@ Module Data_AsyncSave
 			ReadFile = ""
 			Exit Function
 		End If
-		ReadFile = CFS.ReadFileContent(path)
+		ReadFile = PST.ReadFileContent(path)
 	End Function
 
 	' 파일 존재 여부 확인
 	Public Function FileExists(path As String) As Integer
-		FileExists = CFS.FileExists(path)
+		FileExists = PST.FileExists(path)
 	End Function
 
 	' 백업에서 복구
 	Public Function RestoreFromBackup(path As String) As Integer
-		RestoreFromBackup = CFS.RestoreFromBackup(path)
+		RestoreFromBackup = PST.RestoreFromBackup(path)
 	End Function
 
 End Module
+

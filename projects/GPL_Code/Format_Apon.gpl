@@ -1,0 +1,1069 @@
+'Created: 2026/03/26
+'Purpose: APON(Application Properties Object Notation) 계층적 설정 파일 파서/기록기/저장소
+'Reference (official APON docs):
+' - KO: https://aspectran.com/ko/docs/guides/introduce-apon/
+'Note: 본 모듈은 프로젝트 요구사항에 맞춘 APON 유사/부분 구현이며, 공식 Aspectran APON 스펙과 1:1 동일 구현을 보장하지 않음.
+'Format:
+'   # comment
+'   key: value
+'   key: [item1, item2, item3]
+'   key: {
+'       nestedKey: value
+'   }
+'
+'Requires:
+' - Foundation_Utils (CU: CRLF, timeString)
+' - Observability_ErrorHandler (CEH: cehLog, cehLogEx, cehThrow)
+' - Pipeline_AsyncSave (DAS: Enqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup) [AponStore only]
+'Used by:
+' - ORCH_Main, 기타 상위 비즈니스 로직
+Module APN ' Format_Apon VER 1.1.0
+	
+	Public Const APON_VALUE As Integer = 0
+	Public Const APON_BLOCK As Integer = 1
+	Public Const APON_ARRAY As Integer = 2
+	
+	
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''''''''' AponNode '''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+	Public Class AponNode
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''' PRIVATE ''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Dim m_key As String
+		Private Dim m_value As String
+		Private Dim m_nodeType As Integer
+		Private Dim m_children() As AponNode
+		Private Dim m_childCount As Integer
+		Private Dim m_arrayValues() As String
+		Private Dim m_arrayCount As Integer
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' CONSTRUCTORS '''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		' Root or Block node (empty)
+		Public Sub New()
+			m_key = ""
+			m_value = ""
+			m_nodeType = APON_BLOCK
+			m_childCount = 0
+			m_arrayCount = 0
+			ReDim m_children(16)
+			ReDim m_arrayValues(0)
+		End Sub
+		
+		' Named block node
+		Public Sub New(key As String)
+			m_key = key
+			m_value = ""
+			m_nodeType = APON_BLOCK
+			m_childCount = 0
+			m_arrayCount = 0
+			ReDim m_children(16)
+			ReDim m_arrayValues(0)
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' PROPERTIES '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Property key As String
+			Get
+				Return m_key
+			End Get
+			Set (value As String)
+				m_key = value
+			End Set
+		End Property
+		
+		Public ReadOnly Property nodeType As Integer
+			Get
+				Return m_nodeType
+			End Get
+		End Property
+		
+		Public ReadOnly Property childCount As Integer
+			Get
+				Return m_childCount
+			End Get
+		End Property
+		
+		Public ReadOnly Property value As String
+			Get
+				Return m_value
+			End Get
+		End Property
+		
+		Public ReadOnly Property arrayCount As Integer
+			Get
+				Return m_arrayCount
+			End Get
+		End Property
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''' CHILD ACCESS '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		' Find child node by key (returns Nothing if not found)
+		Public Function GetChild(childKey As String) As AponNode
+			Dim i As Integer
+			For i = 0 To m_childCount - 1
+				If m_children(i).key = childKey Then
+					Return m_children(i)
+				End If
+			Next
+			Return Nothing
+		End Function
+		
+		' Get child node by index
+		Public Function GetChildByIndex(index As Integer) As AponNode
+			If index >= 0 And index < m_childCount Then
+				Return m_children(index)
+			End If
+			Return Nothing
+		End Function
+		
+		' Check if child exists
+		Public Function HasChild(childKey As String) As Boolean
+			Dim i As Integer
+			For i = 0 To m_childCount - 1
+				If m_children(i).key = childKey Then
+					Return True
+				End If
+			Next
+			Return False
+		End Function
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''' VALUE GETTERS ''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		' Get string value of child by key
+		Public Function GetString(childKey As String, defaultValue As String) As String
+			Dim child As AponNode
+			child = GetChild(childKey)
+			If child Is Nothing Then
+				Return defaultValue
+			End If
+			Return child.value
+		End Function
+		
+		' Get integer value of child by key
+		Public Function GetInt(childKey As String, defaultValue As Integer) As Integer
+			Dim child As AponNode
+			child = GetChild(childKey)
+			If child Is Nothing Then
+				Return defaultValue
+			End If
+			If child.value.Length = 0 Then
+				Return defaultValue
+			End If
+			Return CInt(child.value)
+		End Function
+		
+		' Get double value of child by key
+		Public Function GetDbl(childKey As String, defaultValue As Double) As Double
+			Dim child As AponNode
+			child = GetChild(childKey)
+			If child Is Nothing Then
+				Return defaultValue
+			End If
+			If child.value.Length = 0 Then
+				Return defaultValue
+			End If
+			Return CDbl(child.value)
+		End Function
+		
+		' NOTE: GPL은 Function에서 배열 반환을 지원하지 않음
+		' 배열 접근은 GetArrayCount(key) + GetChild(key).GetArrayValue(i) 조합 사용
+		
+		' Get array element count of child by key
+		Public Function GetArrayCount(childKey As String) As Integer
+			Dim child As AponNode
+			child = GetChild(childKey)
+			If child Is Nothing Then
+				Return 0
+			End If
+			Return child.arrayCount
+		End Function
+		
+		' Get single array element by index (on this node)
+		Public Function GetArrayValue(index As Integer) As String
+			If index >= 0 And index < m_arrayCount Then
+				Return m_arrayValues(index)
+			End If
+			Return ""
+		End Function
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''' VALUE SETTERS ''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		' Set string value (creates child if not exist)
+		Public Sub SetString(childKey As String, newValue As String)
+			Dim child As AponNode
+			child = GetChild(childKey)
+			If child Is Nothing Then
+				child = New AponNode()
+				child.key = childKey
+				AddChildNode(child)
+			End If
+			child.SetValueData(newValue)
+		End Sub
+		
+		' Set integer value
+		Public Sub SetInt(childKey As String, newValue As Integer)
+			SetString(childKey, CStr(newValue))
+		End Sub
+		
+		' Set double value (3 decimal places)
+		Public Sub SetDbl(childKey As String, newValue As Double)
+			Dim sign As String
+			Dim absVal As Double
+			Dim millis As Integer
+			Dim intPart As Integer
+			Dim fracPart As Integer
+			Dim fracStr As String
+			If newValue < 0 Then
+				sign = "-"
+				absVal = -newValue
+			Else
+				sign = ""
+				absVal = newValue
+			End If
+			millis = CInt(absVal * 1000 + 0.5)
+			intPart = CInt((millis - (millis Mod 1000)) / 1000)
+			fracPart = millis Mod 1000
+			fracStr = CStr(fracPart)
+			While Len(fracStr) < 3
+				fracStr = "0" & fracStr
+			End While
+			SetString(childKey, sign & CStr(intPart) & "." & fracStr)
+		End Sub
+		
+		' Set array values
+		Public Sub SetArray(childKey As String, values() As String, count As Integer)
+			Dim child As AponNode
+			child = GetChild(childKey)
+			If child Is Nothing Then
+				child = New AponNode()
+				child.key = childKey
+				AddChildNode(child)
+			End If
+			child.SetArrayData(values, count)
+		End Sub
+		
+		' Add or get existing block child (returns the block node)
+		Public Function AddBlock(childKey As String) As AponNode
+			Dim existing As AponNode
+			existing = GetChild(childKey)
+			If existing Is Nothing Then
+				Dim child As New AponNode(childKey)
+				AddChildNode(child)
+				Return child
+			Else
+				Return existing
+			End If
+		End Function
+		
+		' Remove child by key
+		Public Sub RemoveChild(childKey As String)
+			Dim i As Integer
+			Dim j As Integer
+			For i = 0 To m_childCount - 1
+				If m_children(i).key = childKey Then
+					For j = i To m_childCount - 2
+						m_children(j) = m_children(j + 1)
+					Next
+					m_childCount = m_childCount - 1
+					Exit Sub
+				End If
+			Next
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		''''''''''''''''''''' INTERNAL '''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		' Set this node as a value node (used by SetString and parser)
+		Public Sub SetValueData(newValue As String)
+			m_value = newValue
+			m_nodeType = APON_VALUE
+		End Sub
+		
+		' Set this node as an array node (used by SetArray and parser)
+		Public Sub SetArrayData(values() As String, count As Integer)
+			Dim i As Integer
+			If count < 0 Then
+				count = 0
+			End If
+			m_nodeType = APON_ARRAY
+			m_arrayCount = count
+			If count <= 0 Then
+				ReDim m_arrayValues(0)
+				Exit Sub
+			End If
+			ReDim m_arrayValues(count - 1)
+			For i = 0 To count - 1
+				m_arrayValues(i) = values(i)
+			Next
+		End Sub
+		
+		' Append child node directly
+		Public Sub AddChildNode(child As AponNode)
+			If m_children.Length <= m_childCount Then
+				ReDim Preserve m_children(m_childCount * 2)
+			End If
+			m_children(m_childCount) = child
+			m_childCount = m_childCount + 1
+		End Sub
+		
+	End Class
+	
+	
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''''''''' AponFile '''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+	Public Class AponFile
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''' PRIVATE ''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Dim m_root As AponNode
+		Private Dim m_filename As String
+		
+		' String-based parser state (LoadFromString용)
+		Private Dim m_parseLines() As String
+		Private Dim m_parseIndex As Integer
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' CONSTRUCTORS '''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Sub New()
+			m_root = New AponNode()
+			m_filename = ""
+		End Sub
+		
+		Public Sub New(filename As String)
+			m_root = New AponNode()
+			m_filename = ""
+			Load(filename)
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' PROPERTIES '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Property fileName As String
+			Get
+				Return m_filename
+			End Get
+			Set (value As String)
+				m_filename = value
+			End Set
+		End Property
+		
+		Public ReadOnly Property root As AponNode
+			Get
+				Return m_root
+			End Get
+		End Property
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''' LOAD / SAVE ''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Sub Load(filename As String)
+			m_filename = filename
+			
+			Dim reader As New StreamReader(m_filename)
+			
+			If reader Is Nothing Then
+				OBS.cehThrow(-508, "APON file not exist: " + m_filename)
+			End If
+			
+			m_root = ParseBlock(reader)
+			reader.Close()
+		End Sub
+		
+		Public Sub Save()
+			SaveToFile()
+		End Sub
+		
+		Public Sub SaveToFile()
+			Dim writer As New StreamWriter(m_filename)
+			
+			If writer Is Nothing Then
+				OBS.cehThrow(-520, "APON file cannot open: " + m_filename)
+			End If
+			
+			WriteBlock(writer, m_root, 0)
+			writer.Close()
+		End Sub
+		
+		' 문자열에서 APON 로드 (DAS/저장소 연동용)
+		Public Sub LoadFromString(content As String)
+			If content = "" Then
+				m_root = New AponNode()
+				Exit Sub
+			End If
+			BuildParseLines(content)
+			m_parseIndex = 0
+			m_root = ParseBlockFromLines()
+		End Sub
+
+		' 문자열을 CRLF 기준 라인 배열로 분해한다.
+		' NOTE:
+		' - 기존 content.Split(FND.CRLF) 사용 시 런타임 구현 차이로
+		'   전체 문자열이 1라인으로 남아 파싱이 실패할 수 있다.
+		Private Sub BuildParseLines(content As String)
+			Dim lines() As String
+			Dim lineCount As Integer
+			Dim fromPos As Integer
+			Dim sepPos As Integer
+			Dim oneLine As String
+
+			lineCount = 0
+			fromPos = 0
+			ReDim lines(16)
+
+			While fromPos <= Len(content)
+				sepPos = content.IndexOf(FND.CRLF, fromPos)
+				If sepPos < 0 Then
+					oneLine = content.Substring(fromPos)
+					If lines.Length <= lineCount Then
+						ReDim Preserve lines(lineCount * 2)
+					End If
+					lines(lineCount) = oneLine
+					lineCount = lineCount + 1
+					Exit While
+				End If
+
+				oneLine = content.Substring(fromPos, sepPos - fromPos)
+				If lines.Length <= lineCount Then
+					ReDim Preserve lines(lineCount * 2)
+				End If
+				lines(lineCount) = oneLine
+				lineCount = lineCount + 1
+
+				fromPos = sepPos + Len(FND.CRLF)
+				If fromPos = Len(content) Then
+					If lines.Length <= lineCount Then
+						ReDim Preserve lines(lineCount * 2)
+					End If
+					lines(lineCount) = ""
+					lineCount = lineCount + 1
+					Exit While
+				End If
+			End While
+
+			If lineCount <= 0 Then
+				ReDim lines(0)
+				lines(0) = ""
+			Else
+				ReDim Preserve lines(lineCount - 1)
+			End If
+
+			m_parseLines = lines
+		End Sub
+		
+		' APON 트리를 문자열로 직렬화
+		Public Function BuildString() As String
+			Return BuildBlockString(m_root, 0)
+		End Function
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''' RECURSIVE PARSER '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Function ParseBlock(reader As StreamReader) As AponNode
+			Dim block As New AponNode()
+			Dim line As String
+			Dim trimmed As String
+			Dim colonPos As Integer
+			Dim theKey As String
+			Dim val As String
+			Dim inner As String
+			Dim parts() As String
+			Dim k As Integer
+			
+			While reader.Peek() <> -1
+				line = reader.ReadLine()
+				trimmed = line.Trim()
+				
+				' Skip empty lines
+				If trimmed.Length = 0 Then
+					' skip
+					
+				ElseIf trimmed.Substring(0, 1) = "#" Then
+					' Skip comments
+					
+				ElseIf trimmed = "}" Then
+					' Block end — return to parent
+					Return block
+					
+				Else
+					' Parse key: value
+					colonPos = trimmed.IndexOf(":", 0)
+					If colonPos >= 1 Then
+						theKey = trimmed.Substring(0, colonPos).Trim()
+						
+						If colonPos + 1 < trimmed.Length Then
+							val = trimmed.Substring(colonPos + 1, trimmed.Length - colonPos - 1).Trim()
+						Else
+							val = ""
+						End If
+						
+						If val = "{" Then
+							' Nested block — recursive call
+							Dim child As AponNode
+							child = ParseBlock(reader)
+							child.key = theKey
+							block.AddChildNode(child)
+							
+						ElseIf val.Length >= 2 Then
+							If val.Substring(0, 1) = "[" And val.Substring(val.Length - 1, 1) = "]" Then
+								' Array value
+								inner = val.Substring(1, val.Length - 2).Trim()
+								If inner.Length > 0 Then
+									parts = inner.Split(",")
+									For k = 0 To parts.Length - 1
+										parts(k) = parts(k).Trim()
+									Next
+									block.SetArray(theKey, parts, parts.Length)
+								Else
+									' Empty array []
+									ReDim parts(0)
+									block.SetArray(theKey, parts, 0)
+								End If
+							Else
+								' Simple value
+								block.SetString(theKey, val)
+							End If
+						Else
+							' Simple value (short or empty)
+							block.SetString(theKey, val)
+						End If
+					End If
+				End If
+			End While
+			
+			Return block
+		End Function
+		
+		' 문자열 배열 기반 재귀 파서 (m_parseLines/m_parseIndex 사용)
+		Private Function ParseBlockFromLines() As AponNode
+			Dim block As New AponNode()
+			Dim trimmed As String
+			Dim colonPos As Integer
+			Dim theKey As String
+			Dim val As String
+			Dim inner As String
+			Dim parts() As String
+			Dim k As Integer
+			
+			While m_parseIndex < m_parseLines.Length
+				trimmed = m_parseLines(m_parseIndex).Trim()
+				m_parseIndex = m_parseIndex + 1
+				
+				If trimmed.Length = 0 Then
+					' skip empty
+					
+				ElseIf trimmed.Substring(0, 1) = "#" Then
+					' skip comments
+					
+				ElseIf trimmed = "}" Then
+					Return block
+					
+				Else
+					colonPos = trimmed.IndexOf(":", 0)
+					If colonPos >= 1 Then
+						theKey = trimmed.Substring(0, colonPos).Trim()
+						
+						If colonPos + 1 < trimmed.Length Then
+							val = trimmed.Substring(colonPos + 1, trimmed.Length - colonPos - 1).Trim()
+						Else
+							val = ""
+						End If
+						
+						If val = "{" Then
+							Dim child As AponNode
+							child = ParseBlockFromLines()
+							child.key = theKey
+							block.AddChildNode(child)
+							
+						ElseIf val.Length >= 2 Then
+							If val.Substring(0, 1) = "[" And val.Substring(val.Length - 1, 1) = "]" Then
+								inner = val.Substring(1, val.Length - 2).Trim()
+								If inner.Length > 0 Then
+									parts = inner.Split(",")
+									For k = 0 To parts.Length - 1
+										parts(k) = parts(k).Trim()
+									Next
+									block.SetArray(theKey, parts, parts.Length)
+								Else
+									ReDim parts(0)
+									block.SetArray(theKey, parts, 0)
+								End If
+							Else
+								block.SetString(theKey, val)
+							End If
+						Else
+							block.SetString(theKey, val)
+						End If
+					End If
+				End If
+			End While
+			
+			Return block
+		End Function
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''' RECURSIVE WRITER '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Sub WriteBlock(writer As StreamWriter, node As AponNode, indent As Integer)
+			Dim i As Integer
+			Dim j As Integer
+			Dim prefix As String
+			Dim child As AponNode
+			Dim arrayStr As String
+			
+			' Build indent prefix
+			prefix = ""
+			For i = 0 To indent - 1
+				prefix = prefix + "    "
+			Next
+			
+			For i = 0 To node.childCount - 1
+				child = node.GetChildByIndex(i)
+				
+				If child.nodeType = APON_VALUE Then
+					writer.WriteLine(prefix + child.key + ": " + child.value)
+					
+				ElseIf child.nodeType = APON_ARRAY Then
+					arrayStr = ""
+					For j = 0 To child.arrayCount - 1
+						If j > 0 Then
+							arrayStr = arrayStr + ", "
+						End If
+						arrayStr = arrayStr + child.GetArrayValue(j)
+					Next
+					writer.WriteLine(prefix + child.key + ": [" + arrayStr + "]")
+					
+				ElseIf child.nodeType = APON_BLOCK Then
+					writer.WriteLine(prefix + child.key + ": {")
+					WriteBlock(writer, child, indent + 1)
+					writer.WriteLine(prefix + "}")
+				End If
+			Next
+		End Sub
+		
+		' 재귀 문자열 직렬화 (BuildString용)
+		Private Function BuildBlockString(node As AponNode, indent As Integer) As String
+			Dim i As Integer
+			Dim j As Integer
+			Dim prefix As String
+			Dim s As String
+			Dim arrayStr As String
+			Dim child As AponNode
+			
+			prefix = ""
+			For i = 0 To indent - 1
+				prefix = prefix + "    "
+			Next
+			
+			s = ""
+			For i = 0 To node.childCount - 1
+				child = node.GetChildByIndex(i)
+				
+				If child.nodeType = APON_VALUE Then
+					s = s + prefix + child.key + ": " + child.value + FND.CRLF
+					
+				ElseIf child.nodeType = APON_ARRAY Then
+					arrayStr = ""
+					For j = 0 To child.arrayCount - 1
+						If j > 0 Then
+							arrayStr = arrayStr + ", "
+						End If
+						arrayStr = arrayStr + child.GetArrayValue(j)
+					Next
+					s = s + prefix + child.key + ": [" + arrayStr + "]" + FND.CRLF
+					
+				ElseIf child.nodeType = APON_BLOCK Then
+					s = s + prefix + child.key + ": {" + FND.CRLF
+					s = s + BuildBlockString(child, indent + 1)
+					s = s + prefix + "}" + FND.CRLF
+				End If
+			Next
+			
+			Return s
+		End Function
+		
+	End Class
+	
+	
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	''''''''''''''''''''''''''' AponStore '''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+	' AponStore: AponFile 기반 저장소 래퍼
+	' - AponFile(순수 파서)을 내부 보유, 트리 읽기/쓰기는 root 프로퍼티로 위임
+	' - DAS 경유 비동기/동기 저장 (Flash 보호)
+	' - 메타데이터 추적 (_SaveCount, _LastSaveTime)
+	' - 변경 감지 (BuildDataSignature) → 불필요한 저장 방지
+	
+	Public Class AponStore
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''' PRIVATE ''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Dim m_file As AponFile
+		Private Dim m_path As String
+		
+		' 메타데이터
+		Private Dim m_saveCount As Integer
+		Private Dim m_lastSaveTime As String
+		Private Dim m_enableMetadata As Integer
+		
+		' 변경 감지
+		Private Dim m_lastDataSig As String
+		Private Dim m_dataChanged As Integer
+		
+		' 디버그
+		Private Dim m_debug As Integer
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' CONSTRUCTORS '''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Sub New()
+			m_file = New AponFile()
+			m_path = ""
+			m_enableMetadata = 1
+			m_lastDataSig = ""
+		End Sub
+		
+		Public Sub New(path As String)
+			m_file = New AponFile()
+			m_path = path
+			m_enableMetadata = 1
+			m_lastDataSig = ""
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' PROPERTIES '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Property Path As String
+			Get
+				Return m_path
+			End Get
+			Set(value As String)
+				m_path = value
+			End Set
+		End Property
+		
+		' AponNode 루트 (직접 트리 조작용)
+		Public ReadOnly Property root As AponNode
+			Get
+				Return m_file.root
+			End Get
+		End Property
+		
+		' 내부 AponFile 직접 접근 (파일 기반 Load/Save 등)
+		Public ReadOnly Property file As AponFile
+			Get
+				Return m_file
+			End Get
+		End Property
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' METADATA '''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Sub EnableMetadata(enable As Integer)
+			If enable <> 0 Then
+				m_enableMetadata = 1
+			Else
+				m_enableMetadata = 0
+			End If
+		End Sub
+		
+		Public Sub SetDebug(level As Integer)
+			If level <= 0 Then
+				m_debug = 0
+			Else
+				m_debug = level
+			End If
+		End Sub
+		
+		Public Function GetSaveCount() As Integer
+			Return m_saveCount
+		End Function
+		
+		Public Function GetLastSaveTime() As String
+			Return m_lastSaveTime
+		End Function
+		
+		Public Sub ResetMetadata()
+			m_saveCount = 0
+			m_lastSaveTime = ""
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''' CHANGE DETECTION '''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		' 재귀적으로 트리 시그니처 생성 (데이터 변경 감지용)
+		Private Function BuildNodeSignature(node As AponNode) As String
+			Dim sig As String
+			Dim i As Integer
+			Dim j As Integer
+			Dim child As AponNode
+			
+			sig = ""
+			For i = 0 To node.childCount - 1
+				child = node.GetChildByIndex(i)
+				sig = sig & CStr(Len(child.key)) & ":" & child.key & "="
+				
+				If child.nodeType = APON_VALUE Then
+					sig = sig & "V" & CStr(Len(child.value)) & ":" & child.value
+				ElseIf child.nodeType = APON_ARRAY Then
+					sig = sig & "A" & CStr(child.arrayCount)
+					For j = 0 To child.arrayCount - 1
+						sig = sig & "," & CStr(Len(child.GetArrayValue(j))) & ":" & child.GetArrayValue(j)
+					Next
+				ElseIf child.nodeType = APON_BLOCK Then
+					sig = sig & "B{" & BuildNodeSignature(child) & "}"
+				End If
+				sig = sig & "|"
+			Next
+			Return sig
+		End Function
+		
+		Private Function BuildDataSignature() As String
+			Return BuildNodeSignature(m_file.root)
+		End Function
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''' FILE I/O '''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		' 저장 공통 준비 (DAT 패턴 호환)
+		' return: 1=저장 진행, 0=스킵 (변경 없음)
+		Private Function PrepareSaveCommon(opName As String, ByRef curSig As String, ByRef content As String) As Integer
+			curSig = BuildDataSignature()
+			
+			DebugLogVerbose("[DEBUG] " & opName & " signature | CurSigLen=" & CStr(Len(curSig)) & " | LastSigLen=" & CStr(Len(m_lastDataSig)))
+			
+			If curSig = m_lastDataSig Then
+				DebugLog("[DEBUG] " & opName & " skipped (no data change) | Path=" & m_path)
+				m_dataChanged = 0
+				Return 0
+			End If
+			DebugLog("[DEBUG] " & opName & " will save | Path=" & m_path)
+			
+			If m_enableMetadata = 1 Then
+				m_saveCount = m_saveCount + 1
+				m_lastSaveTime = FND.timeString()
+			End If
+			
+			content = BuildSaveContent()
+			Return 1
+		End Function
+		
+		' 메타데이터 + APON 데이터 결합
+		Private Function BuildSaveContent() As String
+			Dim s As String
+			s = ""
+			
+			If m_enableMetadata = 1 Then
+				s = s & "# === Metadata ===" & FND.CRLF
+				s = s & "# _SaveCount: " & CStr(m_saveCount) & FND.CRLF
+				s = s & "# _LastSaveTime: " & m_lastSaveTime & FND.CRLF
+				s = s & FND.CRLF
+			End If
+			
+			s = s & m_file.BuildString()
+			Return s
+		End Function
+		
+		' DAS 경유 비동기 저장
+		Public Sub SaveAsync()
+			If m_path = "" Then
+				OBS.cehLog("ERR: AponStore.SaveAsync - Path not set", "AponStore")
+				Exit Sub
+			End If
+			
+			Dim curSig As String
+			Dim content As String
+			If PrepareSaveCommon("SaveAsync", curSig, content) = 0 Then
+				Exit Sub
+			End If
+			
+			PIP.Enqueue(m_path, content)
+			DebugLog("[DEBUG] SaveAsync enqueued | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount))
+			
+			m_lastDataSig = curSig
+			m_dataChanged = 0
+		End Sub
+		
+		' DAS 경유 동기 저장
+		Public Function SaveSync() As Integer
+			If m_path = "" Then
+				OBS.cehLog("ERR: AponStore.SaveSync - Path not set", "AponStore")
+				Return -1
+			End If
+			
+			Dim curSig As String
+			Dim content As String
+			If PrepareSaveCommon("SaveSync", curSig, content) = 0 Then
+				Return 1
+			End If
+			
+			Dim result As Integer
+			result = PIP.SaveSync(m_path, content)
+			DebugLog("[DEBUG] SaveSync done | Result=" & CStr(result) & " | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount))
+			
+			If result = 1 Then
+				m_lastDataSig = curSig
+				m_dataChanged = 0
+			End If
+			Return result
+		End Function
+		
+		' DAS 경유 로드 (동기)
+		Public Function LoadFromFile() As Integer
+			If m_path = "" Then
+				OBS.cehLog("ERR: AponStore.LoadFromFile - Path not set", "AponStore")
+				Return 0
+			End If
+			DebugLog("[DEBUG] LoadFromFile start | Path=" & m_path)
+			
+			If PIP.FileExists(m_path) = 0 Then
+				OBS.cehLog("WARN: AponStore.LoadFromFile - File not exist | Path: " & m_path, "AponStore")
+				Return 0
+			End If
+			
+			Dim content As String
+			Dim ex As New Exception
+			
+			Try
+				content = PIP.ReadFile(m_path)
+				If content = "" Then
+					Return 0
+				End If
+				
+				ExtractMetadata(content)
+				m_file.LoadFromString(content)
+				
+				m_lastDataSig = BuildDataSignature()
+				m_dataChanged = 0
+				DebugLog("[DEBUG] LoadFromFile done | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount) & " | SigLen=" & CStr(Len(m_lastDataSig)))
+				Return 1
+			Catch ex
+				OBS.cehLogEx(ex, "AponStore.LoadFromFile | Path: " & m_path)
+				Return 0
+			End Try
+		End Function
+		
+		' 백업 복구
+		Public Function RestoreFromBackup() As Integer
+			If m_path = "" Then
+				Return 0
+			End If
+			
+			RestoreFromBackup = PIP.RestoreFromBackup(m_path)
+			If RestoreFromBackup = 1 Then
+				LoadFromFile()
+			End If
+		End Function
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''' METADATA EXTRACTION ''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Sub ExtractMetadata(content As String)
+			Dim saveCountStr As String
+			Dim timeStr As String
+			
+			saveCountStr = ExtractMetadataValue(content, "# _SaveCount: ")
+			If Len(saveCountStr) > 0 Then
+				m_saveCount = CInt(saveCountStr)
+			End If
+			
+			timeStr = ExtractMetadataValue(content, "# _LastSaveTime: ")
+			If Len(timeStr) > 0 Then
+				m_lastSaveTime = timeStr
+			End If
+			
+			DebugLogVerbose("[DEBUG] Metadata extracted | SaveCount=" & CStr(m_saveCount) & " | LastSaveTime=" & m_lastSaveTime)
+		End Sub
+		
+		Private Function ExtractMetadataValue(content As String, metaKey As String) As String
+			Dim position As Integer
+			Dim lineEnd As Integer
+			Dim valueStr As String
+			
+			position = InStr(1, content, metaKey)
+			If position > 0 Then
+				position = position + Len(metaKey)
+				lineEnd = InStr(position, content, FND.CRLF)
+				If lineEnd = 0 Then
+					lineEnd = Len(content) + 1
+				End If
+				valueStr = Mid(content, position, lineEnd - position)
+				Return valueStr.Trim()
+			End If
+			Return ""
+		End Function
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' DEBUG HELPERS ''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Private Sub DebugLog(msg As String)
+			If m_debug <> 0 Then
+				OBS.cehLog(msg, "AponStore")
+			End If
+		End Sub
+		
+		Private Sub DebugLogVerbose(msg As String)
+			If m_debug >= 2 Then
+				OBS.cehLog(msg, "AponStore")
+			End If
+		End Sub
+		
+	End Class
+	
+
+End Module
+

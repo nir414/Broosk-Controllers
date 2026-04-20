@@ -1,0 +1,897 @@
+'Created: 9/10/2024 12:17:50 PM
+'Reworked: 12/17/2025 (sandbox repro only)
+Module ORCH_Main ' ORCH_Main VER 1.0.0
+	Public Sub MAIN
+		Dim i As Integer
+		cehLog("Program start", "MAIN")
+		' TestCode-----------------------Start
+		TestStoreCompare()
+		TestMultiDimPattern()
+		' TestCode-------------------------End
+
+		cehLog("Program end", "MAIN")
+	End Sub
+	
+	' ─── Format_Apon 기능 테스트 ───
+	Sub TestApon()
+		Dim ctx As String
+		ctx = "TestApon"
+		cehLog("=== APON TEST START ===", ctx)
+		
+		' ── 1. AponNode 기본 값 타입 테스트 ──
+		Dim root As New AponNode()
+		
+		' SetString / GetString
+		root.SetString("name", "TestBot")
+		cehLog("[1] SetString/GetString  name=" & root.GetString("name", "?"), ctx)
+		
+		' SetInt / GetInt
+		root.SetInt("speed", 1500)
+		cehLog("[2] SetInt/GetInt  speed=" & CStr(root.GetInt("speed", 0)), ctx)
+		
+		' SetDbl / GetDbl
+		root.SetDbl("offset", 3.14159)
+		cehLog("[3] SetDbl/GetDbl  offset=" & root.GetString("offset", "?"), ctx)
+		
+		' GetString default (키 없음)
+		cehLog("[4] Default fallback  missing=" & root.GetString("nokey", "DEFAULT"), ctx)
+		
+		' ── 2. Array 테스트 ──
+		Dim arr(2) As String
+		arr(0) = "apple"
+		arr(1) = "banana"
+		arr(2) = "cherry"
+		root.SetArray("fruits", arr, 3)
+		cehLog("[5] Array count=" & CStr(root.GetArrayCount("fruits")), ctx)
+		
+		Dim arrCount As Integer
+		arrCount = root.GetArrayCount("fruits")
+		Dim fruitNode As AponNode
+		fruitNode = root.GetChild("fruits")
+		Dim arrStr As String
+		arrStr = ""
+		Dim ai As Integer
+		For ai = 0 To arrCount - 1
+			If ai > 0 Then
+				arrStr = arrStr & ", "
+			End If
+			arrStr = arrStr & fruitNode.GetArrayValue(ai)
+		Next
+		cehLog("[6] Array values=[" & arrStr & "]", ctx)
+		
+		' ── 3. Block (중첩) 테스트 ──
+		Dim blk As AponNode
+		blk = root.AddBlock("network")
+		blk.SetString("ip", "192.168.0.10")
+		blk.SetInt("port", 8080)
+		
+		cehLog("[7] Block  ip=" & root.GetChild("network").GetString("ip", "?") & _
+				"  port=" & CStr(root.GetChild("network").GetInt("port", 0)), ctx)
+		
+		' ── 4. RemoveChild 테스트 ──
+		root.RemoveChild("speed")
+		cehLog("[8] After remove speed => GetInt=" & CStr(root.GetInt("speed", -1)), ctx)
+		
+		' ── 5. HasChild 테스트 ──
+		cehLog("[9] HasChild(name)=" & CStr(root.HasChild("name")) & _
+				"  HasChild(speed)=" & CStr(root.HasChild("speed")), ctx)
+		
+		' ── 6. AponFile LoadFromString / BuildString 왕복 테스트 ──
+		Dim aponText As String
+		aponText = "# APON test config" & FND.CRLF & _
+					"robotName: BrookBot" & FND.CRLF & _
+					"version: 2" & FND.CRLF & _
+					"tags: [fast, precise, safe]" & FND.CRLF & _
+					"motor: {" & FND.CRLF & _
+					"	 maxRPM: 3000" & FND.CRLF & _
+					"	 accel: 1.5" & FND.CRLF & _
+					"}" & FND.CRLF
+		
+		Dim af As New AponFile()
+		af.LoadFromString(aponText)
+		
+		Dim r As AponNode
+		r = af.root
+		cehLog("[10] Parse  robotName=" & r.GetString("robotName", "?") & _
+				"  version=" & CStr(r.GetInt("version", 0)), ctx)
+		cehLog("[11] Parse  tags count=" & CStr(r.GetArrayCount("tags")), ctx)
+		
+		Dim motorBlock As AponNode
+		motorBlock = r.GetChild("motor")
+		If motorBlock Is Nothing Then
+			cehLog("[12] Parse  motor block NOT FOUND", ctx)
+		Else
+			cehLog("[12] Parse  motor.maxRPM=" & CStr(motorBlock.GetInt("maxRPM", 0)) & _
+					"  motor.accel=" & motorBlock.GetString("accel", "?"), ctx)
+		End If
+		
+		' BuildString 직렬화
+		Dim serialized As String
+		serialized = af.BuildString()
+		cehLog("[13] BuildString result:" & FND.CRLF & serialized, ctx)
+		
+		' 왕복 검증: 다시 파싱
+		Dim af2 As New AponFile()
+		af2.LoadFromString(serialized)
+		Dim r2 As AponNode
+		r2 = af2.root
+		Dim roundtripOk As String
+		If r2.GetString("robotName", "") = "BrookBot" And r2.GetInt("version", 0) = 2 Then
+			roundtripOk = "PASS"
+		Else
+			roundtripOk = "FAIL"
+		End If
+		cehLog("[14] Roundtrip (LoadFromString->BuildString->LoadFromString) = " & roundtripOk, ctx)
+		
+		cehLog("=== APON TEST END ===", ctx)
+	End Sub
+
+	' ─── AponStore vs DatStore 파일 저장 비교 테스트 (복합 데이터) ───
+	' TEMP_PREFIX (/ROMDISK/temp/) 에 저장하여 Flash 보호
+	Sub TestStoreCompare()
+		Dim ctx As String
+		Dim passCount As Integer
+		Dim failCount As Integer
+		ctx = "StoreCompare"
+		passCount = 0
+		failCount = 0
+		cehLog("=== STORE COMPARE TEST START ===", ctx)
+
+		Dim aponPath As String
+		Dim datPath As String
+		aponPath = PST.TEMP_PREFIX & "test_compare.apon"
+		datPath  = PST.TEMP_PREFIX & "test_compare.dat"
+
+		' ================================================================
+		' [A] AponStore 복합 데이터 테스트
+		' ================================================================
+		cehLog("--- [A] AponStore ---", ctx)
+
+		Dim aStore As New AponStore(aponPath)
+		aStore.SetDebug(1)
+
+		' ── A-1. 기본 스칼라 (String/Int/Dbl) ──
+		aStore.root.SetString("robotName", "BrookBot-X1")
+		aStore.root.SetInt("maxSpeed", 2500)
+		aStore.root.SetDbl("accelRate", 1.618)
+
+		' ── A-2. 음수/0/큰수 ──
+		aStore.root.SetInt("errorCode", -999)
+		aStore.root.SetInt("zeroVal", 0)
+		aStore.root.SetInt("bigVal", 99999)
+		aStore.root.SetDbl("negDbl", -0.005)
+
+		' ── A-3. 다중 배열 ──
+		Dim aTags(2) As String
+		aTags(0) = "fast"
+		aTags(1) = "precise"
+		aTags(2) = "safe"
+		aStore.root.SetArray("tags", aTags, 3)
+
+		Dim aAxes(5) As String
+		aAxes(0) = "100.0"
+		aAxes(1) = "200.5"
+		aAxes(2) = "-50.3"
+		aAxes(3) = "0.0"
+		aAxes(4) = "999.9"
+		aAxes(5) = "-1.0"
+		aStore.root.SetArray("axisPositions", aAxes, 6)
+
+		Dim aSingle(0) As String
+		aSingle(0) = "onlyOne"
+		aStore.root.SetArray("singleArr", aSingle, 1)
+
+		' ── A-4. 중첩 블록 (motor > limits) ──
+		Dim aMotor As AponNode
+		aMotor = aStore.root.AddBlock("motor")
+		aMotor.SetString("type", "BLDC")
+		aMotor.SetInt("rpm", 3000)
+		aMotor.SetDbl("voltage", 24.567)
+
+		Dim aLimits As AponNode
+		aLimits = aMotor.AddBlock("limits")
+		aLimits.SetInt("maxTemp", 85)
+		aLimits.SetInt("minTemp", -20)
+		aLimits.SetDbl("maxCurrent", 15.750)
+
+		' ── A-5. 다중 형제 블록 ──
+		Dim aNetwork As AponNode
+		aNetwork = aStore.root.AddBlock("network")
+		aNetwork.SetString("ip", "192.168.0.10")
+		aNetwork.SetInt("port", 8080)
+		aNetwork.SetString("protocol", "TCP")
+
+		Dim aSafety As AponNode
+		aSafety = aStore.root.AddBlock("safety")
+		aSafety.SetInt("estopEnabled", 1)
+		aSafety.SetDbl("maxForce", 50.000)
+
+		' ── A-6. 값 덮어쓰기 ──
+		aStore.root.SetInt("maxSpeed", 3000)
+
+		' 동기 저장
+		Dim aResult As Integer
+		aResult = aStore.SaveSync()
+		cehLog("[A1] SaveSync result=" & CStr(aResult) & "  path=" & aponPath, ctx)
+
+		' 로드 검증
+		Dim aLoad As New AponStore(aponPath)
+		aLoad.SetDebug(1)
+		Dim aLoadOk As Integer
+		aLoadOk = aLoad.LoadFromFile()
+		cehLog("[A2] LoadFromFile result=" & CStr(aLoadOk), ctx)
+
+		Dim aR As AponNode
+		aR = aLoad.root
+
+		' 스칼라 검증
+		Dim v As String
+		v = ""
+		If aR.GetString("robotName", "") = "BrookBot-X1" Then
+			v = v & "name=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "name=NG "
+			failCount = failCount + 1
+		End If
+		If aR.GetInt("maxSpeed", 0) = 3000 Then
+			v = v & "speed=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "speed=NG "
+			failCount = failCount + 1
+		End If
+		If aR.GetInt("errorCode", 0) = -999 Then
+			v = v & "neg=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "neg=NG "
+			failCount = failCount + 1
+		End If
+		If aR.GetInt("zeroVal", -1) = 0 Then
+			v = v & "zero=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "zero=NG "
+			failCount = failCount + 1
+		End If
+		If aR.GetInt("bigVal", 0) = 99999 Then
+			v = v & "big=OK"
+			passCount = passCount + 1
+		Else
+			v = v & "big=NG"
+			failCount = failCount + 1
+		End If
+		cehLog("[A3] Scalars  " & v, ctx)
+
+		' 다중 배열 검증
+		v = ""
+		If aR.GetArrayCount("tags") = 3 Then
+			v = v & "tags(3)=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "tags(" & CStr(aR.GetArrayCount("tags")) & ")=NG "
+			failCount = failCount + 1
+		End If
+		If aR.GetArrayCount("axisPositions") = 6 Then
+			v = v & "axis(6)=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "axis(" & CStr(aR.GetArrayCount("axisPositions")) & ")=NG "
+			failCount = failCount + 1
+		End If
+		If aR.GetArrayCount("singleArr") = 1 Then
+			v = v & "single(1)=OK"
+			passCount = passCount + 1
+		Else
+			v = v & "single(" & CStr(aR.GetArrayCount("singleArr")) & ")=NG"
+			failCount = failCount + 1
+		End If
+		cehLog("[A4] Arrays  " & v, ctx)
+
+		' 배열 값 샘플 검증
+		Dim aAxisNode As AponNode
+		aAxisNode = aR.GetChild("axisPositions")
+		v = ""
+		If aAxisNode Is Nothing Then
+			v = "axisNode=MISSING"
+			failCount = failCount + 1
+		Else
+			v = "vals=["
+			Dim ai As Integer
+			For ai = 0 To aR.GetArrayCount("axisPositions") - 1
+				If ai > 0 Then
+					v = v & ", "
+				End If
+				v = v & aAxisNode.GetArrayValue(ai)
+			Next
+			v = v & "]"
+			passCount = passCount + 1
+		End If
+		cehLog("[A5] AxisPositions " & v, ctx)
+
+		' 중첩 블록 검증 (motor > limits)
+		v = ""
+		Dim aMotorL As AponNode
+		aMotorL = aR.GetChild("motor")
+		If aMotorL Is Nothing Then
+			v = "motor=MISSING"
+			failCount = failCount + 1
+		Else
+			Dim aLimL As AponNode
+			aLimL = aMotorL.GetChild("limits")
+			If aLimL Is Nothing Then
+				v = "motor=OK limits=MISSING"
+				failCount = failCount + 1
+			Else
+				If aLimL.GetInt("maxTemp", 0) = 85 And aLimL.GetInt("minTemp", 0) = -20 Then
+					v = "motor=OK limits=OK (maxTemp=85 minTemp=-20)"
+					passCount = passCount + 1
+				Else
+					v = "motor=OK limits=NG (maxTemp=" & CStr(aLimL.GetInt("maxTemp", 0)) & ")"
+					failCount = failCount + 1
+				End If
+			End If
+		End If
+		cehLog("[A6] NestedBlock  " & v, ctx)
+
+		' 형제 블록 검증
+		v = ""
+		Dim aNetL As AponNode
+		aNetL = aR.GetChild("network")
+		Dim aSafL As AponNode
+		aSafL = aR.GetChild("safety")
+		If aNetL Is Nothing Then
+			v = v & "network=MISSING "
+			failCount = failCount + 1
+		Else
+			If aNetL.GetString("protocol", "") = "TCP" Then
+				v = v & "network=OK "
+				passCount = passCount + 1
+			Else
+				v = v & "network=NG "
+				failCount = failCount + 1
+			End If
+		End If
+		If aSafL Is Nothing Then
+			v = v & "safety=MISSING"
+			failCount = failCount + 1
+		Else
+			If aSafL.GetInt("estopEnabled", 0) = 1 Then
+				v = v & "safety=OK"
+				passCount = passCount + 1
+			Else
+				v = v & "safety=NG"
+				failCount = failCount + 1
+			End If
+		End If
+		cehLog("[A7] SiblingBlocks  " & v, ctx)
+
+		' SaveCount / 메타데이터 확인
+		cehLog("[A8] SaveCount=" & CStr(aLoad.GetSaveCount()) & _
+				"  LastSaveTime=" & aLoad.GetLastSaveTime(), ctx)
+
+		' ================================================================
+		' [D] DatStore 복합 데이터 테스트
+		' ================================================================
+		cehLog("--- [D] DatStore ---", ctx)
+
+		Dim dStore As New DatStore(datPath)
+		dStore.SetDebug(1)
+
+		' ── D-1. 기본 스칼라 ──
+		dStore.SetValue("robotName", "BrookBot-X1")
+		dStore.SetValue("maxSpeed", "2500")
+		dStore.SetValue("accelRate", "1.618")
+
+		' ── D-2. 음수/0/큰수 ──
+		dStore.SetValue("errorCode", "-999")
+		dStore.SetValue("zeroVal", "0")
+		dStore.SetValue("bigVal", "99999")
+		dStore.SetValue("negDbl", "-0.005")
+
+		' ── D-3. 다중 배열 (JSON 형태) ──
+		dStore.SetValue("tags", "[fast, precise, safe]")
+		dStore.SetValue("axisPositions", "[100.0, 200.5, -50.3, 0.0, 999.9, -1.0]")
+		dStore.SetValue("singleNumArr", "[42.0]")
+
+		' ── D-4. 다중 키 (중첩 없이 flat) ──
+		dStore.SetValue("motorType", "BLDC")
+		dStore.SetValue("motorRPM", "3000")
+		dStore.SetValue("motorVoltage", "24.567")
+		dStore.SetValue("limitsMaxTemp", "85")
+		dStore.SetValue("limitsMinTemp", "-20")
+		dStore.SetValue("limitsMaxCurrent", "15.75")
+
+		' ── D-5. 네트워크/안전 ──
+		dStore.SetValue("networkIP", "192.168.0.10")
+		dStore.SetValue("networkPort", "8080")
+		dStore.SetValue("networkProtocol", "TCP")
+		dStore.SetValue("safetyEstop", "1")
+		dStore.SetValue("safetyMaxForce", "50.0")
+
+		' ── D-6. 값 덮어쓰기 ──
+		dStore.SetValue("maxSpeed", "3000")
+
+		' 동기 저장
+		Dim dResult As Integer
+		dResult = dStore.SaveSync()
+		cehLog("[D1] SaveSync result=" & CStr(dResult) & "  path=" & datPath, ctx)
+
+		' 로드 검증
+		Dim dLoad As New DatStore(datPath)
+		dLoad.SetDebug(1)
+		Dim dLoadOk As Integer
+		dLoadOk = dLoad.LoadFromFile()
+		cehLog("[D2] LoadFromFile result=" & CStr(dLoadOk), ctx)
+
+		' 스칼라 검증
+		v = ""
+		If dLoad.GetValue("robotName") = "BrookBot-X1" Then
+			v = v & "name=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "name=NG "
+			failCount = failCount + 1
+		End If
+		If dLoad.GetValue("maxSpeed") = "3000" Then
+			v = v & "speed=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "speed=NG(" & dLoad.GetValue("maxSpeed") & ") "
+			failCount = failCount + 1
+		End If
+		If dLoad.GetValue("errorCode") = "-999" Then
+			v = v & "neg=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "neg=NG "
+			failCount = failCount + 1
+		End If
+		If dLoad.GetValue("zeroVal") = "0" Then
+			v = v & "zero=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "zero=NG "
+			failCount = failCount + 1
+		End If
+		If dLoad.GetValue("bigVal") = "99999" Then
+			v = v & "big=OK"
+			passCount = passCount + 1
+		Else
+			v = v & "big=NG"
+			failCount = failCount + 1
+		End If
+		cehLog("[D3] Scalars  " & v, ctx)
+
+		' JSON 배열 파싱 검증 (Double 배열)
+		Dim dAxisOut(9) As Double
+		Dim dAxisCount As Integer
+		dAxisCount = dLoad.GetArrayValue("axisPositions", dAxisOut)
+		v = "count=" & CStr(dAxisCount)
+		If dAxisCount = 6 Then
+			v = v & " OK vals=["
+			Dim di As Integer
+			For di = 0 To dAxisCount - 1
+				If di > 0 Then
+					v = v & ", "
+				End If
+				v = v & CStr(dAxisOut(di))
+			Next
+			v = v & "]"
+			passCount = passCount + 1
+		Else
+			v = v & " NG(expected 6)"
+			failCount = failCount + 1
+		End If
+		cehLog("[D4] AxisPositions  " & v, ctx)
+
+		' 단일 요소 배열
+		Dim dSingleOut(0) As Double
+		Dim dSingleCount As Integer
+		dSingleCount = dLoad.GetArrayValue("singleNumArr", dSingleOut)
+		If dSingleCount = 1 Then
+			cehLog("[D5] SingleArr  count=1 val=" & CStr(dSingleOut(0)) & " OK", ctx)
+			passCount = passCount + 1
+		Else
+			cehLog("[D5] SingleArr  count=" & CStr(dSingleCount) & " NG", ctx)
+			failCount = failCount + 1
+		End If
+
+		' flat 키 검증 (중첩 대체)
+		v = ""
+		If dLoad.GetValue("motorType") = "BLDC" Then
+			v = v & "motorType=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "motorType=NG "
+			failCount = failCount + 1
+		End If
+		If dLoad.GetValue("limitsMaxTemp") = "85" And dLoad.GetValue("limitsMinTemp") = "-20" Then
+			v = v & "limits=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "limits=NG "
+			failCount = failCount + 1
+		End If
+		If dLoad.GetValue("networkProtocol") = "TCP" Then
+			v = v & "net=OK "
+			passCount = passCount + 1
+		Else
+			v = v & "net=NG "
+			failCount = failCount + 1
+		End If
+		If dLoad.GetValue("safetyEstop") = "1" Then
+			v = v & "safety=OK"
+			passCount = passCount + 1
+		Else
+			v = v & "safety=NG"
+			failCount = failCount + 1
+		End If
+		cehLog("[D6] FlatKeys  " & v, ctx)
+
+		' SaveCount / 메타데이터 확인
+		cehLog("[D7] SaveCount=" & CStr(dLoad.GetSaveCount()) & _
+				"  LastSaveTime=" & dLoad.GetLastSaveTime(), ctx)
+
+		' ================================================================
+		' [C] 포맷 비교 요약
+		' ================================================================
+		cehLog("--- [C] Format Comparison ---", ctx)
+
+		' 저장된 파일 내용 출력
+		Dim aContent As String
+		aContent = PIP.ReadFile(aponPath)
+		cehLog("[C1] APON file content:" & FND.CRLF & aContent, ctx)
+
+		Dim dContent As String
+		dContent = PIP.ReadFile(datPath)
+		cehLog("[C2] DAT file content:" & FND.CRLF & dContent, ctx)
+
+		' 크기 비교
+		cehLog("[C3] Size  APON=" & CStr(Len(aContent)) & " bytes  DAT=" & CStr(Len(dContent)) & " bytes", ctx)
+
+		' 기능 비교 표
+		cehLog("[C4] Feature comparison:", ctx)
+		cehLog("  | Feature         | APON              | DAT               |", ctx)
+		cehLog("  | Structure       | hierarchical      | flat key=value    |", ctx)
+		cehLog("  | Nested blocks   | YES (block>block) | NO (prefix naming)|", ctx)
+		cehLog("  | Array type      | String[]           | Double[] (JSON)   |", ctx)
+		cehLog("  | Multi-array     | YES               | YES               |", ctx)
+		cehLog("  | Value overwrite | YES               | YES               |", ctx)
+		cehLog("  | Metadata        | # comment header  | ; comment header  |", ctx)
+
+		' 최종 결과
+		cehLog("[C5] Total  PASS=" & CStr(passCount) & "  FAIL=" & CStr(failCount), ctx)
+
+		Dim finalResult As String
+		If failCount = 0 Then
+			finalResult = "ALL PASS"
+		Else
+			finalResult = CStr(failCount) & " FAILED"
+		End If
+		cehLog("[C6] Result = " & finalResult, ctx)
+
+		cehLog("=== STORE COMPARE TEST END ===", ctx)
+	End Sub
+
+	' ─── 다차원 배열 간접 패턴 테스트 ───
+	' AponStore: block 중첩 + 배열로 2D 시뮬레이션
+	' DatStore:  인덱스 키 + JSON 배열로 2D 시뮬레이션
+	Sub TestMultiDimPattern()
+		Dim ctx As String
+		Dim passCount As Integer
+		Dim failCount As Integer
+		ctx = "MultiDim"
+		passCount = 0
+		failCount = 0
+		cehLog("=== MULTI-DIM PATTERN TEST START ===", ctx)
+
+		Dim aponPath As String
+		Dim datPath As String
+		aponPath = PST.TEMP_PREFIX & "test_multidim.apon"
+		datPath  = PST.TEMP_PREFIX & "test_multidim.dat"
+
+		' ================================================================
+		' 테스트 시나리오: 로봇 경로점(waypoint) 3개
+		'   각 경로점 = [x, y, z] 좌표 + speed + label
+		'   → 실질적 2D 구조: waypoints[3][3] + 메타데이터
+		' ================================================================
+
+		' ── [MA] AponStore: block 중첩으로 2D 표현 ──
+		cehLog("--- [MA] AponStore Multi-Dim ---", ctx)
+
+		Dim aStore As New AponStore(aponPath)
+		aStore.SetDebug(1)
+		aStore.root.SetString("pathName", "PickAndPlace-01")
+		aStore.root.SetInt("waypointCount", 3)
+
+		' waypoints 블록
+		Dim aWaypoints As AponNode
+		aWaypoints = aStore.root.AddBlock("waypoints")
+
+		' wp0: 홈 포지션
+		Dim aWp0 As AponNode
+		aWp0 = aWaypoints.AddBlock("wp0")
+		aWp0.SetString("label", "home")
+		aWp0.SetDbl("speed", 100.0)
+		Dim c0(2) As String
+		c0(0) = "0.0"
+		c0(1) = "0.0"
+		c0(2) = "50.0"
+		aWp0.SetArray("coords", c0, 3)
+
+		' wp1: 픽업 위치 (음수 좌표 포함)
+		Dim aWp1 As AponNode
+		aWp1 = aWaypoints.AddBlock("wp1")
+		aWp1.SetString("label", "pick")
+		aWp1.SetDbl("speed", 250.5)
+		Dim c1(2) As String
+		c1(0) = "150.3"
+		c1(1) = "-30.7"
+		c1(2) = "5.0"
+		aWp1.SetArray("coords", c1, 3)
+
+		' wp2: 플레이스 위치 (큰 좌표)
+		Dim aWp2 As AponNode
+		aWp2 = aWaypoints.AddBlock("wp2")
+		aWp2.SetString("label", "place")
+		aWp2.SetDbl("speed", 80.0)
+		Dim c2(2) As String
+		c2(0) = "300.0"
+		c2(1) = "200.0"
+		c2(2) = "-10.5"
+		aWp2.SetArray("coords", c2, 3)
+
+		' 저장
+		Dim aResult As Integer
+		aResult = aStore.SaveSync()
+		cehLog("[MA1] SaveSync result=" & CStr(aResult), ctx)
+
+		' 로드 + 검증
+		Dim aLoad As New AponStore(aponPath)
+		aLoad.SetDebug(1)
+		aLoad.LoadFromFile()
+
+		Dim aR As AponNode
+		aR = aLoad.root
+
+		' pathName 확인
+		If aR.GetString("pathName", "") = "PickAndPlace-01" Then
+			cehLog("[MA2] pathName=OK", ctx)
+			passCount = passCount + 1
+		Else
+			cehLog("[MA2] pathName=NG", ctx)
+			failCount = failCount + 1
+		End If
+
+		' waypoints 블록 존재
+		Dim aWpLoad As AponNode
+		aWpLoad = aR.GetChild("waypoints")
+		If aWpLoad Is Nothing Then
+			cehLog("[MA3] waypoints block=MISSING", ctx)
+			failCount = failCount + 1
+		Else
+			cehLog("[MA3] waypoints block=OK", ctx)
+			passCount = passCount + 1
+
+			' 각 wp 블록 순회 검증
+			Dim wpNames(2) As String
+			Dim wpLabels(2) As String
+			Dim wpX(2) As String
+			Dim wpY(2) As String
+			Dim wpZ(2) As String
+			wpNames(0) = "wp0"
+			wpNames(1) = "wp1"
+			wpNames(2) = "wp2"
+			wpLabels(0) = "home"
+			wpLabels(1) = "pick"
+			wpLabels(2) = "place"
+			wpX(0) = "0.0"
+			wpX(1) = "150.3"
+			wpX(2) = "300.0"
+			wpY(0) = "0.0"
+			wpY(1) = "-30.7"
+			wpY(2) = "200.0"
+			wpZ(0) = "50.0"
+			wpZ(1) = "5.0"
+			wpZ(2) = "-10.5"
+
+			Dim wi As Integer
+			For wi = 0 To 2
+				Dim wpNode As AponNode
+				wpNode = aWpLoad.GetChild(wpNames(wi))
+				If wpNode Is Nothing Then
+					cehLog("[MA4." & CStr(wi) & "] " & wpNames(wi) & "=MISSING", ctx)
+					failCount = failCount + 1
+				Else
+					Dim v As String
+					v = ""
+
+					' label 검증
+					If wpNode.GetString("label", "") = wpLabels(wi) Then
+						v = v & "label=OK "
+					Else
+						v = v & "label=NG "
+						failCount = failCount + 1
+					End If
+
+					' coords 배열 검증 (3요소)
+					If wpNode.GetArrayCount("coords") = 3 Then
+						Dim cNode As AponNode
+						cNode = wpNode.GetChild("coords")
+						If cNode Is Nothing Then
+							v = v & "coords=MISSING"
+							failCount = failCount + 1
+						Else
+							Dim cx As String
+							Dim cy As String
+							Dim cz As String
+							cx = cNode.GetArrayValue(0)
+							cy = cNode.GetArrayValue(1)
+							cz = cNode.GetArrayValue(2)
+							v = v & "coords=[" & cx & "," & cy & "," & cz & "]"
+
+							If cx = wpX(wi) And cy = wpY(wi) And cz = wpZ(wi) Then
+								v = v & " OK"
+								passCount = passCount + 1
+							Else
+								v = v & " NG(expected " & wpX(wi) & "," & wpY(wi) & "," & wpZ(wi) & ")"
+								failCount = failCount + 1
+							End If
+						End If
+					Else
+						v = v & "coords count=" & CStr(wpNode.GetArrayCount("coords")) & " NG"
+						failCount = failCount + 1
+					End If
+
+					cehLog("[MA4." & CStr(wi) & "] " & wpNames(wi) & "  " & v, ctx)
+				End If
+			Next
+		End If
+
+		' APON 파일 내용 출력
+		Dim aContent As String
+		aContent = PIP.ReadFile(aponPath)
+		cehLog("[MA5] File content:" & FND.CRLF & aContent, ctx)
+
+		' ── [MD] DatStore: 인덱스 키로 2D 표현 ──
+		cehLog("--- [MD] DatStore Multi-Dim ---", ctx)
+
+		Dim dStore As New DatStore(datPath)
+		dStore.SetDebug(1)
+		dStore.SetValue("pathName", "PickAndPlace-01")
+		dStore.SetValue("waypointCount", "3")
+
+		' wp0
+		dStore.SetValue("wp0_label", "home")
+		dStore.SetValue("wp0_speed", "100.0")
+		dStore.SetValue("wp0_coords", "[0.0, 0.0, 50.0]")
+
+		' wp1 (음수 좌표)
+		dStore.SetValue("wp1_label", "pick")
+		dStore.SetValue("wp1_speed", "250.5")
+		dStore.SetValue("wp1_coords", "[150.3, -30.7, 5.0]")
+
+		' wp2 (큰 좌표)
+		dStore.SetValue("wp2_label", "place")
+		dStore.SetValue("wp2_speed", "80.0")
+		dStore.SetValue("wp2_coords", "[300.0, 200.0, -10.5]")
+
+		' 저장
+		Dim dResult As Integer
+		dResult = dStore.SaveSync()
+		cehLog("[MD1] SaveSync result=" & CStr(dResult), ctx)
+
+		' 로드 + 검증
+		Dim dLoad As New DatStore(datPath)
+		dLoad.SetDebug(1)
+		dLoad.LoadFromFile()
+
+		' pathName 확인
+		If dLoad.GetValue("pathName") = "PickAndPlace-01" Then
+			cehLog("[MD2] pathName=OK", ctx)
+			passCount = passCount + 1
+		Else
+			cehLog("[MD2] pathName=NG", ctx)
+			failCount = failCount + 1
+		End If
+
+		' 각 wp 검증 (인덱스 키 패턴)
+		Dim dwpLabels(2) As String
+		Dim dwpSpeeds(2) As String
+		dwpLabels(0) = "home"
+		dwpLabels(1) = "pick"
+		dwpLabels(2) = "place"
+		dwpSpeeds(0) = "100.0"
+		dwpSpeeds(1) = "250.5"
+		dwpSpeeds(2) = "80.0"
+
+		' 기대 좌표 (x,y,z per waypoint)
+		Dim dExpX(2) As Double
+		Dim dExpY(2) As Double
+		Dim dExpZ(2) As Double
+		dExpX(0) = 0.0
+		dExpX(1) = 150.3
+		dExpX(2) = 300.0
+		dExpY(0) = 0.0
+		dExpY(1) = -30.7
+		dExpY(2) = 200.0
+		dExpZ(0) = 50.0
+		dExpZ(1) = 5.0
+		dExpZ(2) = -10.5
+
+		Dim dwi As Integer
+		For dwi = 0 To 2
+			Dim prefix As String
+			prefix = "wp" & CStr(dwi)
+			Dim dv As String
+			dv = ""
+
+			' label
+			If dLoad.GetValue(prefix & "_label") = dwpLabels(dwi) Then
+				dv = dv & "label=OK "
+			Else
+				dv = dv & "label=NG "
+				failCount = failCount + 1
+			End If
+
+			' speed
+			If dLoad.GetValue(prefix & "_speed") = dwpSpeeds(dwi) Then
+				dv = dv & "speed=OK "
+			Else
+				dv = dv & "speed=NG "
+				failCount = failCount + 1
+			End If
+
+			' coords (JSON 배열 → Double 파싱)
+			Dim dCoords(2) As Double
+			Dim dCcount As Integer
+			dCcount = dLoad.GetArrayValue(prefix & "_coords", dCoords)
+			If dCcount = 3 Then
+				dv = dv & "coords=[" & CStr(dCoords(0)) & "," & CStr(dCoords(1)) & "," & CStr(dCoords(2)) & "]"
+				If dCoords(0) = dExpX(dwi) And dCoords(1) = dExpY(dwi) And dCoords(2) = dExpZ(dwi) Then
+					dv = dv & " OK"
+					passCount = passCount + 1
+				Else
+					dv = dv & " NG(values mismatch)"
+					failCount = failCount + 1
+				End If
+			Else
+				dv = dv & "coords count=" & CStr(dCcount) & " NG"
+				failCount = failCount + 1
+			End If
+
+			cehLog("[MD3." & CStr(dwi) & "] " & prefix & "  " & dv, ctx)
+		Next
+
+		' DAT 파일 내용 출력
+		Dim dContent As String
+		dContent = PIP.ReadFile(datPath)
+		cehLog("[MD4] File content:" & FND.CRLF & dContent, ctx)
+
+		' ================================================================
+		' 비교 요약
+		' ================================================================
+		cehLog("--- [MC] Multi-Dim Comparison ---", ctx)
+		cehLog("  | Pattern          | APON                         | DAT                          |", ctx)
+		cehLog("  | 2D 표현          | block > block > array        | indexedKey_coords=[...]       |", ctx)
+		cehLog("  | 메타데이터 위치  | 블록 내부 sibling (label,spd) | 동일 prefix 키 (wp0_label)    |", ctx)
+		cehLog("  | 순회 방식        | GetChild(wpN).GetChild(coords)| GetArrayValue(wpN_coords)    |", ctx)
+		cehLog("  | 가독성           | 계층적 (사람 친화)            | 플랫 (기계 친화)              |", ctx)
+
+		' 최종 결과
+		cehLog("[MC1] Total  PASS=" & CStr(passCount) & "  FAIL=" & CStr(failCount), ctx)
+		Dim mdResult As String
+		If failCount = 0 Then
+			mdResult = "ALL PASS"
+		Else
+			mdResult = CStr(failCount) & " FAILED"
+		End If
+		cehLog("[MC2] Result = " & mdResult, ctx)
+
+		cehLog("=== MULTI-DIM PATTERN TEST END ===", ctx)
+	End Sub
+
+End Module
+

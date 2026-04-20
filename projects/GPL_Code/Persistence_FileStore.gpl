@@ -3,7 +3,7 @@
 'Notes:
 ' - LEGACY ModuleName(Storage_File_Manager) 대체 구현
 ' - 신규/개선 코드는 CFS 모듈명을 사용
-Module CFS ' Core_FileStore VER 1.0.0
+Module PST ' Persistence_FileStore VER 1.0.0
 
 	' 저장 결과 상수
 	Public Const SAVE_SUCCESS As Integer = 1
@@ -23,22 +23,22 @@ Module CFS ' Core_FileStore VER 1.0.0
 	'=========================
 	Public Function SafeSaveFile(path As String, content As String, useBackup As Integer) As Integer
 		If path Is Nothing Then
-			CEH.cehLog("ERR: Invalid path or empty content", "CFS.SafeSaveFile")
+			OBS.cehLog("ERR: Invalid path or empty content", "PST.SafeSaveFile")
 			SafeSaveFile = SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
 		If content Is Nothing Then
-			CEH.cehLog("ERR: Invalid path or empty content", "CFS.SafeSaveFile")
+			OBS.cehLog("ERR: Invalid path or empty content", "PST.SafeSaveFile")
 			SafeSaveFile = SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
 		If path = "" Then
-			CEH.cehLog("ERR: Invalid path or empty content", "CFS.SafeSaveFile")
+			OBS.cehLog("ERR: Invalid path or empty content", "PST.SafeSaveFile")
 			SafeSaveFile = SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
 		If content = "" Then
-			CEH.cehLog("ERR: Invalid path or empty content", "CFS.SafeSaveFile")
+			OBS.cehLog("ERR: Invalid path or empty content", "PST.SafeSaveFile")
 			SafeSaveFile = SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
@@ -101,13 +101,13 @@ Module CFS ' Core_FileStore VER 1.0.0
 					isFirstLine = 0
 					content = line
 				Else
-					content = content & CU.CRLF & line
+					content = content & FND.CRLF & line
 				End If
 			Loop
 			reader.Close()
 			ReadFileContent = content
 		Catch ex
-			CEH.cehLogEx(ex, "CFS.ReadFileContent | Path: " & path)
+			OBS.cehLogEx(ex, "PST.ReadFileContent | Path: " & path)
 			ReadFileContent = ""
 		End Try
 	End Function
@@ -118,15 +118,15 @@ Module CFS ' Core_FileStore VER 1.0.0
 			Dim backupPath As String
 			backupPath = path & ".bak"
 			If Not FileExists(backupPath) Then
-				CEH.cehLog("WARN: No backup found | Path: " & backupPath, "CFS.RestoreFromBackup")
+				OBS.cehLog("WARN: No backup found | Path: " & backupPath, "PST.RestoreFromBackup")
 				RestoreFromBackup = 0
 				Exit Function
 			End If
 			File.Copy(backupPath, path)
-			CEH.cehLog("Restored from backup | Path: " & path, "CFS.RestoreFromBackup")
+			OBS.cehLog("Restored from backup | Path: " & path, "PST.RestoreFromBackup")
 			RestoreFromBackup = 1
 		Catch ex
-			CEH.cehLogEx(ex, "CFS.RestoreFromBackup | Path: " & path)
+			OBS.cehLogEx(ex, "PST.RestoreFromBackup | Path: " & path)
 			RestoreFromBackup = 0
 		End Try
 	End Function
@@ -142,10 +142,10 @@ Module CFS ' Core_FileStore VER 1.0.0
 			backupPath = path & ".deleted"
 			File.Copy(path, backupPath)
 			File.DeleteFile(path)
-			CEH.cehLog("File deleted with backup | Path: " & path, "CFS.DeleteFileWithBackup")
+			OBS.cehLog("File deleted with backup | Path: " & path, "PST.DeleteFileWithBackup")
 			DeleteFileWithBackup = 1
 		Catch ex
-			CEH.cehLogEx(ex, "CFS.DeleteFileWithBackup | Path: " & path)
+			OBS.cehLogEx(ex, "PST.DeleteFileWithBackup | Path: " & path)
 			DeleteFileWithBackup = 0
 		End Try
 	End Function
@@ -159,11 +159,11 @@ Module CFS ' Core_FileStore VER 1.0.0
 			For i = 0 To files.Length - 1
 				If Mid(files(i), Len(files(i)) - 3) = ".tmp" Then
 					File.DeleteFile(TEMP_PREFIX & files(i))
-					CEH.cehLog("Cleaned temp file | File: " & files(i), "CFS.CleanupTempFiles")
+					OBS.cehLog("Cleaned temp file | File: " & files(i), "PST.CleanupTempFiles")
 				End If
 			Next
 		Catch ex
-			CEH.cehLogEx(ex, "CFS.CleanupTempFiles")
+			OBS.cehLogEx(ex, "PST.CleanupTempFiles")
 		End Try
 	End Sub
 
@@ -184,7 +184,7 @@ Module CFS ' Core_FileStore VER 1.0.0
 		tempPath = GenerateTempPath(path)
 
 		If DirectSaveFile(tempPath, content) <> SAVE_SUCCESS Then
-			CEH.cehLog("ERR: Failed to write temp file | Path: " & tempPath, "CFS.SafeSaveToFlash")
+			OBS.cehLog("ERR: Failed to write temp file | Path: " & tempPath, "PST.SafeSaveToFlash")
 			SafeSaveToFlash = SAVE_ERROR_TEMP_FAILED
 			Exit Function
 		End If
@@ -192,17 +192,17 @@ Module CFS ' Core_FileStore VER 1.0.0
 		If useBackup = 1 And FileExists(path) Then
 			backupPath = path & ".bak"
 			If Not CreateBackup(path, backupPath) Then
-				CEH.cehLog("WARN: Backup creation failed | Path: " & backupPath, "CFS.SafeSaveToFlash")
+				OBS.cehLog("WARN: Backup creation failed | Path: " & backupPath, "PST.SafeSaveToFlash")
 			End If
 		End If
 
 		If Not AtomicMove(tempPath, path) Then
-			CEH.cehLog("ERR: Failed to move temp to final | Temp: " & tempPath & " -> Final: " & path, "CFS.SafeSaveToFlash")
+			OBS.cehLog("ERR: Failed to move temp to final | Temp: " & tempPath & " -> Final: " & path, "PST.SafeSaveToFlash")
 			SafeSaveToFlash = SAVE_ERROR_MOVE_FAILED
 			Exit Function
 		End If
 
-		CEH.cehLog("Safe save completed | Path: " & path, "CFS.SafeSaveToFlash")
+		OBS.cehLog("Safe save completed | Path: " & path, "PST.SafeSaveToFlash")
 		SafeSaveToFlash = SAVE_SUCCESS
 	End Function
 
@@ -216,7 +216,7 @@ Module CFS ' Core_FileStore VER 1.0.0
 			writer.Close()
 			DirectSaveFile = SAVE_SUCCESS
 		Catch ex
-			CEH.cehLogEx(ex, "CFS.DirectSaveFile | Path: " & path)
+			OBS.cehLogEx(ex, "PST.DirectSaveFile | Path: " & path)
 			DirectSaveFile = SAVE_ERROR_WRITE_FAILED
 		End Try
 	End Function
@@ -263,22 +263,28 @@ Module CFS ' Core_FileStore VER 1.0.0
 		End Try
 	End Function
 
+	' パス文字列中の最後の "/" 位置を返す (0-based index)。見つからなければ -1。
+	Private Function FindLastSlashPos(ByVal path As String) As Integer
+		Dim i As Integer
+		FindLastSlashPos = -1
+		For i = Len(path) To 1 Step -1
+			If Mid(path, i, 1) = "/" Then
+				FindLastSlashPos = i
+				Exit Function
+			End If
+		Next
+	End Function
+
 	Private Function GenerateTempPath(originalPath As String) As String
 		Dim fileName As String
 		Dim pos As Integer
-		Dim i As Integer
-		pos = 0
-		For i = 1 To Len(originalPath)
-			If Mid(originalPath, i, 1) = "/" Then
-				pos = i
-			End If
-		Next
+		pos = FindLastSlashPos(originalPath)
 		If pos > 0 Then
 			fileName = Mid(originalPath, pos + 1)
 		Else
 			fileName = originalPath
 		End If
-		GenerateTempPath = TEMP_PREFIX & fileName & "_" & CU.timeString() & ".tmp"
+		GenerateTempPath = TEMP_PREFIX & fileName & "_" & FND.timeString() & ".tmp"
 	End Function
 
 	Private Function EnsureDirectory(filePath As String) As Integer
@@ -286,13 +292,7 @@ Module CFS ' Core_FileStore VER 1.0.0
 		Try
 			Dim dirPath As String
 			Dim pos As Integer
-			Dim i As Integer
-			pos = 0
-			For i = 1 To Len(filePath)
-				If Mid(filePath, i, 1) = "/" Then
-					pos = i
-				End If
-			Next
+			pos = FindLastSlashPos(filePath)
 			If pos > 0 Then
 				dirPath = Mid(filePath, 1, pos - 1)
 				File.CreateDirectory(dirPath)
@@ -302,10 +302,11 @@ Module CFS ' Core_FileStore VER 1.0.0
 			If ex.ErrorCode = -510 Then
 				EnsureDirectory = 1
 			Else
-				Console.WriteLine(CU.timeString() & " [" & Thread.CurrentThread.Name & "] ERR(" & CStr(ex.ErrorCode) & "): CFS.EnsureDirectory - " & ex.Message() & " | Path: " & filePath)
+				Console.WriteLine(FND.timeString() & " [" & Thread.CurrentThread.Name & "] ERR(" & CStr(ex.ErrorCode) & "): PST.EnsureDirectory - " & ex.Message() & " | Path: " & filePath)
 				EnsureDirectory = 0
 			End If
 		End Try
 	End Function
 
 End Module
+

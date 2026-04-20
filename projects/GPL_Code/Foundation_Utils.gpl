@@ -1,11 +1,11 @@
 'Created: 9/10/2024 12:19:11 PM
-'Module: CU (was Core_Utils)
+'Module: FND (was Foundation_Utils)
 'Purpose: 시간/문자 상수(CRLF/TAB) 및 작은 유틸 함수 모음
 'Requires:
 ' - (none)
 'Used by:
-' - CEH, Net_Tcp_*, Storage_*, Data_*, Entry_Main
-Module CU ' Core_Utils VER 1.0.0
+' - CEH, Net_Tcp_*, Storage_*, Data_*, ORCH_Main
+Module FND ' Foundation_Utils VER 1.0.0
 	' 기본적인 함수나 변수들을 모아 놓은 모듈이다.
 	'
 	'=========================
@@ -13,7 +13,7 @@ Module CU ' Core_Utils VER 1.0.0
 	'=========================
 	Public Const CR As String = Chr(13)
 	Public Const LF As String = Chr(10)
-	Public Const CRLF As String = CR & LF ' CU.CRLF
+	Public Const CRLF As String = CR & LF ' FND.CRLF
 	Public Const TAB As String = Chr(9)
 	
 	Public Function timeString() As String
@@ -130,3 +130,4 @@ Module CU ' Core_Utils VER 1.0.0
 		Return result
 	End Function
 End Module
+

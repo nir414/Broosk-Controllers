@@ -1,0 +1,268 @@
+'Created: 12/16/2025
+'Adapted: GPL_Code architecture (from Test_robot/Net_Tcp_CommandQueue.gpl)
+'Purpose: TCP 수신 라인(명령) 전달용 고정 크기 큐 (네트워크 스레드 -> 메인 스레드)
+'
+' [의존성 모듈]
+' - Concurrency_RingQueue.gpl    (Module RNQ): RingQueue_String 클래스
+' - Concurrency_SpinLock.gpl     (Module SNC): SpinLock 클래스
+' [사용처]
+' - Networking_TcpCommunication  (Module NTC): 연결별 채널 준비/바인딩
+' - Networking_TcpServerLoop     (Module NSV): Enqueue
+' - Orchestration_Main           (Module ORCH_Main): GetChannel(i) polling
+'
+' 설계:
+'  - 연결별(채널별) 독립 큐 제공 (MAX_CHANNELS=32)
+'  - Ring buffer (QUEUE_MAX=128) + overflow 시 oldest drop 정책
+'  - SpinLock 클래스 인스턴스로 동시성 보호
+'  - 채널별 drop count, 무결성 진단 기능 제공
+'
+' 채널 ID:
+'  - channelId = sourceIndex (TcpCommunication 내부 인덱스)
+'  - 여러 통신이 동시 진행되어도 서로의 큐/drop 카운트 분리
+Module NCQ ' Networking_TcpCommandQueue VER 1.0.0
+	' 공개 상수로 노출 (소규모 프로젝트 단순화)
+	Public Const MAX_CHANNELS As Integer = 32
+
+	' 고정 크기 circular queue (ring buffer)
+	Private Const QUEUE_MAX As Integer = 128
+
+	' 채널별 큐를 객체로 보유한다.
+	Private Dim channels(MAX_CHANNELS-1) As TcpCommandQueueChannel
+	' 채널 초기화 1회만 수행 플래그 (재호출 시 큐 초기화 방지)
+	Private Dim ch_init(MAX_CHANNELS-1) As Integer
+	' 채널 객체 생성/배열 접근 보호
+	Private Dim initLock As New SpinLock
+
+	' 범위를 초과한 sourceIndex를 위한 드랍 카운트
+	Private Dim droppedOverflow As Integer
+	Private Dim overflowLock As New SpinLock
+
+	' TryDequeue(any) 라운드로빈 인덱스 보호
+	Private Dim rrLock As New SpinLock
+	Private Dim rr_last As Integer
+
+	'=========================
+	' Channel queue class
+	'=========================
+	Public Class TcpCommandQueueChannel
+		Private m_q As RingQueue_String
+
+		Public Sub New()
+			' Invariant: 생성자 이후 m_q는 항상 유효하다.
+			m_q = New RingQueue_String(QUEUE_MAX)
+		End Sub
+
+		' 채널 상태 초기화
+		Public Sub Reset()
+			m_q.Reset()
+		End Sub
+
+		' Enqueue one line (overflow: drop oldest)
+		Public Sub Enqueue(ByVal line As String)
+			m_q.EnqueueDropOldest(line)
+		End Sub
+
+		' 1=성공(꺼냄), 0=없음
+		Public Function TryDequeue(ByRef line As String) As Integer
+			TryDequeue = m_q.TryDequeue(line)
+		End Function
+
+		Public Function PendingCount() As Integer
+			PendingCount = m_q.PendingCount()
+		End Function
+
+		Public Function DroppedCount() As Integer
+			DroppedCount = m_q.DroppedCount()
+		End Function
+
+		' 1=정상, 0=오염
+		Public Function ValidateIntegrity() As Integer
+			ValidateIntegrity = m_q.ValidateIntegrity()
+		End Function
+	End Class
+
+	'=========================
+	' Public API
+	'=========================
+	' GetChannel: 채널 객체 접근 (채널별 singleton)
+	Public Function GetChannel(ByVal channelId As Integer) As TcpCommandQueueChannel
+		If channelId < 0 Or channelId >= MAX_CHANNELS Then
+			GetChannel = Nothing
+			Exit Function
+		End If
+
+		' Lazy create per-channel queue object (thread-safe)
+		If channels(channelId) Is Nothing Then
+			initLock.Acquire()
+			If channels(channelId) Is Nothing Then
+				channels(channelId) = New TcpCommandQueueChannel
+			End If
+			initLock.Release()
+		End If
+		GetChannel = channels(channelId)
+	End Function
+
+	' EnsureChannel: 채널 준비 (idempotent, 1회만 초기화)
+	Public Sub EnsureChannel(ByVal channelId As Integer)
+		Dim ch As TcpCommandQueueChannel
+		ch = GetChannel(channelId)
+		If ch Is Nothing Then Exit Sub
+		' 같은 채널에 대해 여러 번 호출되더라도 큐를 초기화하지 않도록 1회만 수행
+		If Thread.TestAndSet(ch_init(channelId), 1) = 0 Then
+			ch.Reset()
+		End If
+	End Sub
+
+	' 전체 큐 초기화 (테스트/재시작 시)
+	Public Sub ResetAll()
+		Dim i As Integer
+		For i = 0 To MAX_CHANNELS - 1
+			ResetChannel(i)
+			ch_init(i) = 0
+		Next
+		overflowLock.Acquire()
+		droppedOverflow = 0
+		overflowLock.Release()
+		rrLock.Acquire()
+		rr_last = 0
+		rrLock.Release()
+	End Sub
+
+	' 채널별 큐 초기화
+	Public Sub ResetChannel(ByVal channelId As Integer)
+		Dim ch As TcpCommandQueueChannel
+		ch = GetChannel(channelId)
+		If ch Is Nothing Then Exit Sub
+		ch.Reset()
+	End Sub
+
+	' enqueue; channelId = sourceIndex
+	' overflow 시 가장 오래된 항목 drop (채널별)
+	Public Sub Enqueue(ByVal sourceIndex As Integer, ByVal line As String)
+		Dim ch As TcpCommandQueueChannel
+		If line Is Nothing Then line = ""
+		If sourceIndex < 0 Or sourceIndex >= MAX_CHANNELS Then
+			overflowLock.Acquire()
+			droppedOverflow += 1
+			overflowLock.Release()
+			Exit Sub
+		End If
+		ch = GetChannel(sourceIndex)
+		ch.Enqueue(line)
+	End Sub
+
+	' 채널 지정 dequeue (1=성공, 0=없음)
+	Public Function TryDequeueFor(ByVal channelId As Integer, ByRef line As String) As Integer
+		Dim ch As TcpCommandQueueChannel
+		ch = GetChannel(channelId)
+		If ch Is Nothing Then
+			line = ""
+			TryDequeueFor = 0
+			Exit Function
+		End If
+		TryDequeueFor = ch.TryDequeue(line)
+	End Function
+
+	' 전체(any 채널) dequeue - 라운드로빈 (1=성공, 0=없음)
+	Public Function TryDequeue(ByRef sourceIndex As Integer, ByRef line As String) As Integer
+		Dim i As Integer
+		Dim start As Integer
+		Dim ch As Integer
+
+		rrLock.Acquire()
+		start = rr_last
+		rrLock.Release()
+
+		For i = 0 To MAX_CHANNELS - 1
+			ch = (start + i) Mod MAX_CHANNELS
+			If TryDequeueFor(ch, line) = 1 Then
+				sourceIndex = ch
+				rrLock.Acquire()
+				rr_last = (ch + 1) Mod MAX_CHANNELS
+				rrLock.Release()
+				TryDequeue = 1
+				Exit Function
+			End If
+		Next
+		sourceIndex = -1
+		line = ""
+		TryDequeue = 0
+	End Function
+
+	' 채널별 pending 길이 조회
+	Public Function PendingCountFor(ByVal channelId As Integer) As Integer
+		Dim ch As TcpCommandQueueChannel
+		ch = GetChannel(channelId)
+		If ch Is Nothing Then
+			PendingCountFor = 0
+			Exit Function
+		End If
+		PendingCountFor = ch.PendingCount()
+	End Function
+
+	' 전체 pending 길이 조회 (채널 합)
+	Public Function PendingCount() As Integer
+		Dim i As Integer
+		Dim total As Integer
+		total = 0
+		For i = 0 To MAX_CHANNELS - 1
+			total = total + PendingCountFor(i)
+		Next
+		PendingCount = total
+	End Function
+
+	' 채널별 drop(overflow) 발생 횟수 조회
+	Public Function GetDroppedCountFor(ByVal channelId As Integer) As Integer
+		Dim ch As TcpCommandQueueChannel
+		ch = GetChannel(channelId)
+		If ch Is Nothing Then
+			GetDroppedCountFor = 0
+			Exit Function
+		End If
+		GetDroppedCountFor = ch.DroppedCount()
+	End Function
+
+	' 전체 drop 횟수 조회 (채널 합 + overflow)
+	Public Function GetDroppedCount() As Integer
+		Dim i As Integer
+		Dim total As Integer
+		overflowLock.Acquire()
+		total = droppedOverflow
+		overflowLock.Release()
+		For i = 0 To MAX_CHANNELS - 1
+			total = total + GetDroppedCountFor(i)
+		Next
+		GetDroppedCount = total
+	End Function
+
+	' MAX_CHANNELS 범위를 초과한 sourceIndex 드랍 횟수
+	Public Function GetDroppedOverflowCount() As Integer
+		overflowLock.Acquire()
+		GetDroppedOverflowCount = droppedOverflow
+		overflowLock.Release()
+	End Function
+
+	' 채널별 무결성 진단 (1=정상, 0=오염)
+	Public Function ValidateQueueIntegrityFor(ByVal channelId As Integer) As Integer
+		Dim ch As TcpCommandQueueChannel
+		ch = GetChannel(channelId)
+		If ch Is Nothing Then
+			ValidateQueueIntegrityFor = 0
+			Exit Function
+		End If
+		ValidateQueueIntegrityFor = ch.ValidateIntegrity()
+	End Function
+
+	' 전체 무결성 진단 (1=정상, 0=오염)
+	Public Function ValidateQueueIntegrity() As Integer
+		Dim i As Integer
+		For i = 0 To MAX_CHANNELS - 1
+			If ValidateQueueIntegrityFor(i) = 0 Then
+				ValidateQueueIntegrity = 0
+				Exit Function
+			End If
+		Next
+		ValidateQueueIntegrity = 1
+	End Function
+
+End Module
