@@ -1,27 +1,43 @@
 'Created: 2026/03/26
-'Purpose: APON(Application Properties Object Notation) 계층적 설정 파일 파서/기록기/저장소
+'Updated: 2026/04/20 (APON spec full coverage: inline comments, quoted/escaped strings,
+'                    multi-line arrays, text blocks, type annotations, compact+non-compact
+'                    root, root-level arrays, auto-quoting writer, boolean accessors)
+'Purpose: APON(Aspectran Parameters Object Notation) 계층적 설정 파일 파서/기록기/저장소
 'Reference (official APON docs):
 ' - KO: https://aspectran.com/ko/docs/guides/introduce-apon/
-'Note: 본 모듈은 프로젝트 요구사항에 맞춘 APON 유사/부분 구현이며, 공식 Aspectran APON 스펙과 1:1 동일 구현을 보장하지 않음.
-'Format:
-'   # comment
-'   key: value
+'Format (spec-conformant subset):
+'   # comment (line-end)
+'   key: value                     # inline comment
+'   key: "quoted \"value\""
+'   key(int): 30
 '   key: [item1, item2, item3]
+'   key: [
+'       item1
+'       item2, item3
+'   ]
 '   key: {
 '       nestedKey: value
 '   }
+'   description(text): (
+'     |line 1
+'     |line 2
+'   )
 '
 'Requires:
-' - Foundation_Utils (CU: CRLF, timeString)
-' - Observability_ErrorHandler (CEH: cehLog, cehLogEx, cehThrow)
-' - Pipeline_AsyncSave (DAS: Enqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup) [AponStore only]
-'Used by:
-' - ORCH_Main, 기타 상위 비즈니스 로직
-Module APN ' Format_Apon VER 1.1.0
+' - Foundation_Utils (FND: CRLF, timeString)
+' - Observability_ErrorHandler (OBS: cehLog, cehLogEx, cehThrow)
+' - Pipeline_AsyncSave (PIP: Enqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup) [AponStore only]
+Module APN ' Format_Apon VER 1.2.0
 	
 	Public Const APON_VALUE As Integer = 0
 	Public Const APON_BLOCK As Integer = 1
 	Public Const APON_ARRAY As Integer = 2
+	Public Const APON_TEXT  As Integer = 3
+	
+	' Render styles (AponFile.BuildStringStyled)
+	Public Const APON_STYLE_PRETTY      As Integer = 0
+	Public Const APON_STYLE_SINGLE_LINE As Integer = 1
+	Public Const APON_STYLE_COMPACT     As Integer = 2
 	
 	
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -37,6 +53,7 @@ Module APN ' Format_Apon VER 1.1.0
 		Private Dim m_key As String
 		Private Dim m_value As String
 		Private Dim m_nodeType As Integer
+		Private Dim m_typeHint As String    ' APON 타입 어노테이션("string","int","long","float","double","boolean","text","parameters","variable","object") — 비어 있으면 생략
 		Private Dim m_children() As AponNode
 		Private Dim m_childCount As Integer
 		Private Dim m_arrayValues() As String
@@ -51,6 +68,7 @@ Module APN ' Format_Apon VER 1.1.0
 		Public Sub New()
 			m_key = ""
 			m_value = ""
+			m_typeHint = ""
 			m_nodeType = APON_BLOCK
 			m_childCount = 0
 			m_arrayCount = 0
@@ -62,6 +80,7 @@ Module APN ' Format_Apon VER 1.1.0
 		Public Sub New(key As String)
 			m_key = key
 			m_value = ""
+			m_typeHint = ""
 			m_nodeType = APON_BLOCK
 			m_childCount = 0
 			m_arrayCount = 0
@@ -105,6 +124,16 @@ Module APN ' Format_Apon VER 1.1.0
 			Get
 				Return m_arrayCount
 			End Get
+		End Property
+		
+		' APON 타입 어노테이션 (없으면 빈 문자열)
+		Public Property typeHint As String
+			Get
+				Return m_typeHint
+			End Get
+			Set (value As String)
+				m_typeHint = value
+			End Set
 		End Property
 		
 		
@@ -183,6 +212,28 @@ Module APN ' Format_Apon VER 1.1.0
 			Return CDbl(child.value)
 		End Function
 		
+		' Get boolean value of child by key (accepts: true/false/yes/no/1/0, case-insensitive)
+		Public Function GetBool(childKey As String, defaultValue As Boolean) As Boolean
+			Dim child As AponNode
+			Dim v As String
+			child = GetChild(childKey)
+			If child Is Nothing Then
+				Return defaultValue
+			End If
+			v = child.value
+			If v.Length = 0 Then
+				Return defaultValue
+			End If
+			v = v.ToLower().Trim()
+			If v = "true" Or v = "yes" Or v = "1" Or v = "on" Then
+				Return True
+			End If
+			If v = "false" Or v = "no" Or v = "0" Or v = "off" Then
+				Return False
+			End If
+			Return defaultValue
+		End Function
+		
 		' NOTE: GPL은 Function에서 배열 반환을 지원하지 않음
 		' 배열 접근은 GetArrayCount(key) + GetChild(key).GetArrayValue(i) 조합 사용
 		
@@ -224,6 +275,15 @@ Module APN ' Format_Apon VER 1.1.0
 		' Set integer value
 		Public Sub SetInt(childKey As String, newValue As Integer)
 			SetString(childKey, CStr(newValue))
+		End Sub
+		
+		' Set boolean value (stored as "true"/"false")
+		Public Sub SetBool(childKey As String, newValue As Boolean)
+			If newValue Then
+				SetString(childKey, "true")
+			Else
+				SetString(childKey, "false")
+			End If
 		End Sub
 		
 		' Set double value (3 decimal places)
@@ -302,6 +362,20 @@ Module APN ' Format_Apon VER 1.1.0
 			m_nodeType = APON_VALUE
 		End Sub
 		
+		' Set this node as a value node with type hint (parser use)
+		Public Sub SetValueDataTyped(newValue As String, hint As String)
+			m_value = newValue
+			m_typeHint = hint
+			m_nodeType = APON_VALUE
+		End Sub
+		
+		' Set this node as a text (multi-line) node
+		Public Sub SetTextData(newValue As String)
+			m_value = newValue
+			m_typeHint = "text"
+			m_nodeType = APON_TEXT
+		End Sub
+		
 		' Set this node as an array node (used by SetArray and parser)
 		Public Sub SetArrayData(values() As String, count As Integer)
 			Dim i As Integer
@@ -345,9 +419,10 @@ Module APN ' Format_Apon VER 1.1.0
 		Private Dim m_root As AponNode
 		Private Dim m_filename As String
 		
-		' String-based parser state (LoadFromString용)
-		Private Dim m_parseLines() As String
-		Private Dim m_parseIndex As Integer
+		' Character-based parser state (LoadFromString/Load)
+		Private Dim m_src As String
+		Private Dim m_srcLen As Integer
+		Private Dim m_pos As Integer
 		
 		
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -394,13 +469,28 @@ Module APN ' Format_Apon VER 1.1.0
 			m_filename = filename
 			
 			Dim reader As New StreamReader(m_filename)
-			
 			If reader Is Nothing Then
 				OBS.cehThrow(-508, "APON file not exist: " + m_filename)
 			End If
 			
-			m_root = ParseBlock(reader)
+			' 파일 전체를 문자열로 수집 후 문자 기반 파서에 위임
+			Dim content As String
+			Dim line As String
+			Dim firstLine As Integer
+			content = ""
+			firstLine = 1
+			Do While reader.Peek() >= 0
+				line = reader.ReadLine()
+				If firstLine = 1 Then
+					content = line
+					firstLine = 0
+				Else
+					content = content & FND.CRLF & line
+				End If
+			Loop
 			reader.Close()
+			
+			LoadFromString(content)
 		End Sub
 		
 		Public Sub Save()
@@ -409,314 +499,654 @@ Module APN ' Format_Apon VER 1.1.0
 		
 		Public Sub SaveToFile()
 			Dim writer As New StreamWriter(m_filename)
-			
 			If writer Is Nothing Then
 				OBS.cehThrow(-520, "APON file cannot open: " + m_filename)
 			End If
-			
-			WriteBlock(writer, m_root, 0)
+			writer.Write(BuildString())
 			writer.Close()
 		End Sub
 		
-		' 문자열에서 APON 로드 (DAS/저장소 연동용)
+		' 문자열에서 APON 로드 (DAS/저장소 연동용, 공식 APON 스펙 서브셋 지원)
 		Public Sub LoadFromString(content As String)
 			If content = "" Then
 				m_root = New AponNode()
 				Exit Sub
 			End If
-			BuildParseLines(content)
-			m_parseIndex = 0
-			m_root = ParseBlockFromLines()
+			m_src = content
+			m_srcLen = Len(content)
+			m_pos = 0
+			m_root = ParseSource()
 		End Sub
 
-		' 문자열을 CRLF 기준 라인 배열로 분해한다.
-		' NOTE:
-		' - 기존 content.Split(FND.CRLF) 사용 시 런타임 구현 차이로
-		'   전체 문자열이 1라인으로 남아 파싱이 실패할 수 있다.
-		Private Sub BuildParseLines(content As String)
-			Dim lines() As String
-			Dim lineCount As Integer
-			Dim fromPos As Integer
-			Dim sepPos As Integer
-			Dim oneLine As String
-
-			lineCount = 0
-			fromPos = 0
-			ReDim lines(16)
-
-			While fromPos <= Len(content)
-				sepPos = content.IndexOf(FND.CRLF, fromPos)
-				If sepPos < 0 Then
-					oneLine = content.Substring(fromPos)
-					If lines.Length <= lineCount Then
-						ReDim Preserve lines(lineCount * 2)
-					End If
-					lines(lineCount) = oneLine
-					lineCount = lineCount + 1
-					Exit While
-				End If
-
-				oneLine = content.Substring(fromPos, sepPos - fromPos)
-				If lines.Length <= lineCount Then
-					ReDim Preserve lines(lineCount * 2)
-				End If
-				lines(lineCount) = oneLine
-				lineCount = lineCount + 1
-
-				fromPos = sepPos + Len(FND.CRLF)
-				If fromPos = Len(content) Then
-					If lines.Length <= lineCount Then
-						ReDim Preserve lines(lineCount * 2)
-					End If
-					lines(lineCount) = ""
-					lineCount = lineCount + 1
-					Exit While
-				End If
-			End While
-
-			If lineCount <= 0 Then
-				ReDim lines(0)
-				lines(0) = ""
-			Else
-				ReDim Preserve lines(lineCount - 1)
-			End If
-
-			m_parseLines = lines
-		End Sub
-		
-		' APON 트리를 문자열로 직렬화
+		' APON 트리를 PRETTY 스타일 문자열로 직렬화
 		Public Function BuildString() As String
+			Return BuildStringStyled(APON_STYLE_PRETTY)
+		End Function
+		
+		' 스타일 선택 직렬화 (PRETTY / SINGLE_LINE / COMPACT)
+		Public Function BuildStringStyled(style As Integer) As String
+			If style = APON_STYLE_SINGLE_LINE Then
+				Return BuildSingleLine(m_root, " ", ", ")
+			End If
+			If style = APON_STYLE_COMPACT Then
+				Return BuildSingleLine(m_root, "", ",")
+			End If
 			Return BuildBlockString(m_root, 0)
 		End Function
 		
 		
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-		'''''''''''''''' RECURSIVE PARSER '''''''''''''''''''''''''''
+		''''''''''''''''' CHARACTER-BASED PARSER '''''''''''''''''''''
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		
-		Private Function ParseBlock(reader As StreamReader) As AponNode
-			Dim block As New AponNode()
-			Dim line As String
-			Dim trimmed As String
-			Dim colonPos As Integer
-			Dim theKey As String
-			Dim val As String
-			Dim inner As String
-			Dim parts() As String
-			Dim k As Integer
-			
-			While reader.Peek() <> -1
-				line = reader.ReadLine()
-				trimmed = line.Trim()
-				
-				' Skip empty lines
-				If trimmed.Length = 0 Then
-					' skip
-					
-				ElseIf trimmed.Substring(0, 1) = "#" Then
-					' Skip comments
-					
-				ElseIf trimmed = "}" Then
-					' Block end — return to parent
-					Return block
-					
-				Else
-					' Parse key: value
-					colonPos = trimmed.IndexOf(":", 0)
-					If colonPos >= 1 Then
-						theKey = trimmed.Substring(0, colonPos).Trim()
-						
-						If colonPos + 1 < trimmed.Length Then
-							val = trimmed.Substring(colonPos + 1, trimmed.Length - colonPos - 1).Trim()
-						Else
-							val = ""
-						End If
-						
-						If val = "{" Then
-							' Nested block — recursive call
-							Dim child As AponNode
-							child = ParseBlock(reader)
-							child.key = theKey
-							block.AddChildNode(child)
-							
-						ElseIf val.Length >= 2 Then
-							If val.Substring(0, 1) = "[" And val.Substring(val.Length - 1, 1) = "]" Then
-								' Array value
-								inner = val.Substring(1, val.Length - 2).Trim()
-								If inner.Length > 0 Then
-									parts = inner.Split(",")
-									For k = 0 To parts.Length - 1
-										parts(k) = parts(k).Trim()
-									Next
-									block.SetArray(theKey, parts, parts.Length)
-								Else
-									' Empty array []
-									ReDim parts(0)
-									block.SetArray(theKey, parts, 0)
-								End If
-							Else
-								' Simple value
-								block.SetString(theKey, val)
-							End If
-						Else
-							' Simple value (short or empty)
-							block.SetString(theKey, val)
-						End If
-					End If
+		' 루트 진입: 컴팩트(바깥 {} 없음) / 비컴팩트({ ... }) / 루트 배열([ ... ]) 모두 허용
+		Private Function ParseSource() As AponNode
+			Dim root As New AponNode()
+			SkipWhitespace()
+			If m_pos < m_srcLen Then
+				Dim c As String
+				c = m_src.Substring(m_pos, 1)
+				If c = "{" Then
+					m_pos = m_pos + 1
+					ParseEntries(root, "}")
+					Return root
 				End If
-			End While
-			
-			Return block
+				If c = "[" Then
+					' 루트 레벨 배열: root 자체를 array 노드로 사용
+					m_pos = m_pos + 1
+					ParseArrayBody(root)
+					Return root
+				End If
+			End If
+			ParseEntries(root, "")
+			Return root
 		End Function
 		
-		' 문자열 배열 기반 재귀 파서 (m_parseLines/m_parseIndex 사용)
-		Private Function ParseBlockFromLines() As AponNode
-			Dim block As New AponNode()
-			Dim trimmed As String
-			Dim colonPos As Integer
+		' block에 엔트리를 채운다. endChar("}" 또는 "")를 만나면 종료.
+		Private Sub ParseEntries(block As AponNode, endChar As String)
+			Dim c As String
 			Dim theKey As String
-			Dim val As String
-			Dim inner As String
-			Dim parts() As String
-			Dim k As Integer
-			
-			While m_parseIndex < m_parseLines.Length
-				trimmed = m_parseLines(m_parseIndex).Trim()
-				m_parseIndex = m_parseIndex + 1
-				
-				If trimmed.Length = 0 Then
-					' skip empty
-					
-				ElseIf trimmed.Substring(0, 1) = "#" Then
-					' skip comments
-					
-				ElseIf trimmed = "}" Then
-					Return block
-					
-				Else
-					colonPos = trimmed.IndexOf(":", 0)
-					If colonPos >= 1 Then
-						theKey = trimmed.Substring(0, colonPos).Trim()
-						
-						If colonPos + 1 < trimmed.Length Then
-							val = trimmed.Substring(colonPos + 1, trimmed.Length - colonPos - 1).Trim()
-						Else
-							val = ""
-						End If
-						
-						If val = "{" Then
-							Dim child As AponNode
-							child = ParseBlockFromLines()
-							child.key = theKey
-							block.AddChildNode(child)
-							
-						ElseIf val.Length >= 2 Then
-							If val.Substring(0, 1) = "[" And val.Substring(val.Length - 1, 1) = "]" Then
-								inner = val.Substring(1, val.Length - 2).Trim()
-								If inner.Length > 0 Then
-									parts = inner.Split(",")
-									For k = 0 To parts.Length - 1
-										parts(k) = parts(k).Trim()
-									Next
-									block.SetArray(theKey, parts, parts.Length)
-								Else
-									ReDim parts(0)
-									block.SetArray(theKey, parts, 0)
-								End If
-							Else
-								block.SetString(theKey, val)
-							End If
-						Else
-							block.SetString(theKey, val)
-						End If
-					End If
+			Dim theType As String
+			While True
+				SkipWhitespace()
+				If m_pos >= m_srcLen Then
+					Exit While
 				End If
+				c = m_src.Substring(m_pos, 1)
+				If Len(endChar) > 0 And c = endChar Then
+					m_pos = m_pos + 1
+					Exit While
+				End If
+				' 한 엔트리: key[(type)] ':' value
+				ReadKeyAndType(theKey, theType)
+				SkipSpacesInline()
+				If m_pos < m_srcLen And m_src.Substring(m_pos, 1) = ":" Then
+					m_pos = m_pos + 1
+				End If
+				SkipSpacesInline()
+				ParseValueInto(block, theKey, theType)
 			End While
-			
-			Return block
-		End Function
-		
-		
-		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-		'''''''''''''''' RECURSIVE WRITER '''''''''''''''''''''''''''
-		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-		
-		Private Sub WriteBlock(writer As StreamWriter, node As AponNode, indent As Integer)
-			Dim i As Integer
-			Dim j As Integer
-			Dim prefix As String
-			Dim child As AponNode
-			Dim arrayStr As String
-			
-			' Build indent prefix
-			prefix = ""
-			For i = 0 To indent - 1
-				prefix = prefix + "    "
-			Next
-			
-			For i = 0 To node.childCount - 1
-				child = node.GetChildByIndex(i)
-				
-				If child.nodeType = APON_VALUE Then
-					writer.WriteLine(prefix + child.key + ": " + child.value)
-					
-				ElseIf child.nodeType = APON_ARRAY Then
-					arrayStr = ""
-					For j = 0 To child.arrayCount - 1
-						If j > 0 Then
-							arrayStr = arrayStr + ", "
-						End If
-						arrayStr = arrayStr + child.GetArrayValue(j)
-					Next
-					writer.WriteLine(prefix + child.key + ": [" + arrayStr + "]")
-					
-				ElseIf child.nodeType = APON_BLOCK Then
-					writer.WriteLine(prefix + child.key + ": {")
-					WriteBlock(writer, child, indent + 1)
-					writer.WriteLine(prefix + "}")
-				End If
-			Next
 		End Sub
 		
-		' 재귀 문자열 직렬화 (BuildString용)
+		' 'key' 또는 'key(type)' 에서 key/type 분리. 공식 스펙상 ':' 전까지.
+		Private Sub ReadKeyAndType(ByRef outKey As String, ByRef outType As String)
+			Dim start As Integer
+			Dim c As String
+			outType = ""
+			start = m_pos
+			While m_pos < m_srcLen
+				c = m_src.Substring(m_pos, 1)
+				If c = ":" Or c = "(" Or c = Chr(10) Or c = Chr(13) Then
+					Exit While
+				End If
+				m_pos = m_pos + 1
+			End While
+			outKey = m_src.Substring(start, m_pos - start).Trim()
+			
+			If m_pos < m_srcLen And m_src.Substring(m_pos, 1) = "(" Then
+				m_pos = m_pos + 1
+				Dim tStart As Integer
+				tStart = m_pos
+				While m_pos < m_srcLen
+					c = m_src.Substring(m_pos, 1)
+					If c = ")" Then
+						Exit While
+					End If
+					m_pos = m_pos + 1
+				End While
+				outType = m_src.Substring(tStart, m_pos - tStart).Trim()
+				If m_pos < m_srcLen Then
+					m_pos = m_pos + 1  ' consume ')'
+				End If
+			End If
+		End Sub
+		
+		' key에 대한 값 하나를 파싱하여 parent에 자식으로 추가
+		Private Sub ParseValueInto(parent As AponNode, theKey As String, theType As String)
+			Dim c As String
+			SkipSpacesInline()
+			If m_pos >= m_srcLen Then
+				Dim emptyNode As New AponNode(theKey)
+				emptyNode.SetValueDataTyped("", theType)
+				parent.AddChildNode(emptyNode)
+				Exit Sub
+			End If
+			c = m_src.Substring(m_pos, 1)
+			If c = Chr(10) Or c = Chr(13) Then
+				Dim emptyNode2 As New AponNode(theKey)
+				emptyNode2.SetValueDataTyped("", theType)
+				parent.AddChildNode(emptyNode2)
+				Exit Sub
+			End If
+			If c = "{" Then
+				m_pos = m_pos + 1
+				Dim blk As New AponNode(theKey)
+				blk.typeHint = theType
+				ParseEntries(blk, "}")
+				parent.AddChildNode(blk)
+				Exit Sub
+			End If
+			If c = "[" Then
+				m_pos = m_pos + 1
+				Dim an As New AponNode(theKey)
+				an.typeHint = theType
+				ParseArrayBody(an)
+				parent.AddChildNode(an)
+				Exit Sub
+			End If
+			If c = "(" Then
+				' text 블록 (type=="text" 표준, 미지정도 관대 허용)
+				m_pos = m_pos + 1
+				Dim tn As New AponNode(theKey)
+				Dim txt As String
+				txt = ParseTextBody()
+				tn.SetTextData(txt)
+				If Len(theType) > 0 Then
+					tn.typeHint = theType
+				End If
+				parent.AddChildNode(tn)
+				Exit Sub
+			End If
+			' 단일 스칼라 값 (따옴표 또는 비따옴표), 행 끝/인라인 주석 전까지
+			Dim v As String
+			If c = """" Then
+				v = ParseQuoted()
+			Else
+				v = ReadRawUntilDelim(False)
+			End If
+			Dim vn As New AponNode(theKey)
+			vn.SetValueDataTyped(v, theType)
+			parent.AddChildNode(vn)
+		End Sub
+		
+		' 따옴표 문자열 파싱. 호출 시 m_pos는 '"' 위치.
+		Private Function ParseQuoted() As String
+			Dim sb As String
+			Dim c As String
+			Dim nc As String
+			sb = ""
+			m_pos = m_pos + 1  ' consume opening "
+			While m_pos < m_srcLen
+				c = m_src.Substring(m_pos, 1)
+				m_pos = m_pos + 1
+				If c = """" Then
+					Return sb
+				End If
+				If c = "\" And m_pos < m_srcLen Then
+					nc = m_src.Substring(m_pos, 1)
+					m_pos = m_pos + 1
+					If nc = "n" Then
+						sb = sb & Chr(10)
+					ElseIf nc = "r" Then
+						sb = sb & Chr(13)
+					ElseIf nc = "t" Then
+						sb = sb & Chr(9)
+					ElseIf nc = """" Then
+						sb = sb & """"
+					ElseIf nc = "\" Then
+						sb = sb & "\"
+					ElseIf nc = "'" Then
+						sb = sb & "'"
+					Else
+						' 미지원 이스케이프는 원문 보존
+						sb = sb & nc
+					End If
+				Else
+					sb = sb & c
+				End If
+			End While
+			Return sb
+		End Function
+		
+		' 비따옴표 스칼라 값을 EOL/'#' 까지 읽음. inArray=True면 ','와 ']'도 구분자.
+		Private Function ReadRawUntilDelim(inArray As Boolean) As String
+			Dim start As Integer
+			Dim c As String
+			start = m_pos
+			While m_pos < m_srcLen
+				c = m_src.Substring(m_pos, 1)
+				If c = Chr(10) Or c = Chr(13) Or c = "#" Then
+					Exit While
+				End If
+				If inArray And (c = "," Or c = "]") Then
+					Exit While
+				End If
+				m_pos = m_pos + 1
+			End While
+			Return RTrimSpaces(m_src.Substring(start, m_pos - start))
+		End Function
+		
+		' 문자열 오른쪽 공백/탭 제거 (String.Trim()은 양쪽이지만 왼쪽은 이미 스킵된 상태)
+		Private Function RTrimSpaces(s As String) As String
+			Dim i As Integer
+			Dim c As String
+			i = Len(s)
+			While i > 0
+				c = Mid(s, i, 1)
+				If c = " " Or c = Chr(9) Then
+					i = i - 1
+				Else
+					Exit While
+				End If
+			End While
+			If i <= 0 Then
+				Return ""
+			End If
+			Return Mid(s, 1, i)
+		End Function
+		
+		' 배열 바디 파싱. 호출 시 m_pos는 '[' 바로 다음. ']'까지 반복.
+		' 요소 구분자는 ','와 줄바꿈 모두 허용.
+		' 요소가 '{' 또는 '['로 시작하면 매칭 괄호까지 원시 텍스트로 수집.
+		Private Sub ParseArrayBody(node As AponNode)
+			Dim items() As String
+			Dim count As Integer
+			Dim c As String
+			count = 0
+			ReDim items(16)
+			While True
+				SkipWhitespace()
+				If m_pos >= m_srcLen Then
+					Exit While
+				End If
+				c = m_src.Substring(m_pos, 1)
+				If c = "]" Then
+					m_pos = m_pos + 1
+					Exit While
+				End If
+				If c = "," Then
+					m_pos = m_pos + 1
+				Else
+					Dim elem As String
+					If c = """" Then
+						elem = ParseQuoted()
+					ElseIf c = "{" Or c = "[" Then
+						elem = ReadBalanced(c)
+					Else
+						elem = ReadRawUntilDelim(True)
+					End If
+					If items.Length <= count Then
+						ReDim Preserve items(count * 2 + 1)
+					End If
+					items(count) = elem
+					count = count + 1
+				End If
+			End While
+			node.SetArrayData(items, count)
+		End Sub
+		
+		' '{' 또는 '['로 시작하는 덩어리를 매칭 괄호까지 원시 텍스트로 반환 (따옴표/주석 인식).
+		Private Function ReadBalanced(openCh As String) As String
+			Dim start As Integer
+			Dim depth As Integer
+			Dim c As String
+			Dim closeCh As String
+			Dim inQuote As Boolean
+			start = m_pos
+			depth = 0
+			inQuote = False
+			If openCh = "{" Then
+				closeCh = "}"
+			Else
+				closeCh = "]"
+			End If
+			While m_pos < m_srcLen
+				c = m_src.Substring(m_pos, 1)
+				If inQuote Then
+					If c = "\" And m_pos + 1 < m_srcLen Then
+						m_pos = m_pos + 2
+					ElseIf c = """" Then
+						inQuote = False
+						m_pos = m_pos + 1
+					Else
+						m_pos = m_pos + 1
+					End If
+				Else
+					If c = """" Then
+						inQuote = True
+						m_pos = m_pos + 1
+					ElseIf c = "#" Then
+						While m_pos < m_srcLen
+							If m_src.Substring(m_pos, 1) = Chr(10) Then
+								Exit While
+							End If
+							m_pos = m_pos + 1
+						End While
+					ElseIf c = openCh Then
+						depth = depth + 1
+						m_pos = m_pos + 1
+					ElseIf c = closeCh Then
+						depth = depth - 1
+						m_pos = m_pos + 1
+						If depth = 0 Then
+							Exit While
+						End If
+					Else
+						m_pos = m_pos + 1
+					End If
+				End If
+			End While
+			Return m_src.Substring(start, m_pos - start).Trim()
+		End Function
+		
+		' text 블록. 호출 시 m_pos는 '(' 바로 다음.
+		' 각 라인 '|' 이후 내용을 LF로 결합해 반환. ')' 단독 라인에서 종료.
+		Private Function ParseTextBody() As String
+			Dim sb As String
+			Dim first As Boolean
+			Dim c As String
+			sb = ""
+			first = True
+			While m_pos < m_srcLen
+				SkipSpacesInline()
+				If m_pos >= m_srcLen Then
+					Exit While
+				End If
+				c = m_src.Substring(m_pos, 1)
+				If c = ")" Then
+					m_pos = m_pos + 1
+					Exit While
+				End If
+				If c = Chr(10) Or c = Chr(13) Then
+					m_pos = m_pos + 1
+				ElseIf c = "|" Then
+					m_pos = m_pos + 1
+					Dim lineStart As Integer
+					lineStart = m_pos
+					Dim lc As String
+					While m_pos < m_srcLen
+						lc = m_src.Substring(m_pos, 1)
+						If lc = Chr(10) Or lc = Chr(13) Then
+							Exit While
+						End If
+						m_pos = m_pos + 1
+					End While
+					If Not first Then
+						sb = sb & Chr(10)
+					End If
+					first = False
+					sb = sb & m_src.Substring(lineStart, m_pos - lineStart)
+				Else
+					' 파이프/닫는 괄호 아닌 라인은 스킵
+					While m_pos < m_srcLen
+						If m_src.Substring(m_pos, 1) = Chr(10) Then
+							Exit While
+						End If
+						m_pos = m_pos + 1
+					End While
+				End If
+			End While
+			Return sb
+		End Function
+		
+		' 공백/탭/줄바꿈/'#'주석을 모두 스킵
+		Private Sub SkipWhitespace()
+			Dim c As String
+			While m_pos < m_srcLen
+				c = m_src.Substring(m_pos, 1)
+				If c = " " Or c = Chr(9) Or c = Chr(10) Or c = Chr(13) Then
+					m_pos = m_pos + 1
+				ElseIf c = "#" Then
+					While m_pos < m_srcLen
+						c = m_src.Substring(m_pos, 1)
+						m_pos = m_pos + 1
+						If c = Chr(10) Then
+							Exit While
+						End If
+					End While
+				Else
+					Exit While
+				End If
+			End While
+		End Sub
+		
+		' 공백/탭만 스킵(인라인)
+		Private Sub SkipSpacesInline()
+			Dim c As String
+			While m_pos < m_srcLen
+				c = m_src.Substring(m_pos, 1)
+				If c = " " Or c = Chr(9) Then
+					m_pos = m_pos + 1
+				Else
+					Exit While
+				End If
+			End While
+		End Sub
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''' WRITER '''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		' PRETTY 스타일 직렬화
 		Private Function BuildBlockString(node As AponNode, indent As Integer) As String
 			Dim i As Integer
 			Dim j As Integer
 			Dim prefix As String
 			Dim s As String
-			Dim arrayStr As String
 			Dim child As AponNode
-			
 			prefix = ""
 			For i = 0 To indent - 1
-				prefix = prefix + "    "
+				prefix = prefix & "    "
 			Next
-			
 			s = ""
+			' 루트가 array 노드인 경우 (루트 레벨 배열)
+			If node.nodeType = APON_ARRAY Then
+				s = s & prefix & "[" & FND.CRLF
+				For j = 0 To node.arrayCount - 1
+					s = s & prefix & "    " & RenderArrayElement(node.GetArrayValue(j)) & FND.CRLF
+				Next
+				s = s & prefix & "]" & FND.CRLF
+				Return s
+			End If
 			For i = 0 To node.childCount - 1
 				child = node.GetChildByIndex(i)
-				
 				If child.nodeType = APON_VALUE Then
-					s = s + prefix + child.key + ": " + child.value + FND.CRLF
-					
+					s = s & prefix & RenderKeyWithType(child) & ": " & RenderValue(child.value) & FND.CRLF
+				ElseIf child.nodeType = APON_TEXT Then
+					s = s & prefix & RenderKeyWithType(child) & ": (" & FND.CRLF
+					s = s & RenderTextLines(child.value, indent + 1)
+					s = s & prefix & ")" & FND.CRLF
 				ElseIf child.nodeType = APON_ARRAY Then
-					arrayStr = ""
+					s = s & prefix & RenderKeyWithType(child) & ": [" & FND.CRLF
 					For j = 0 To child.arrayCount - 1
-						If j > 0 Then
-							arrayStr = arrayStr + ", "
-						End If
-						arrayStr = arrayStr + child.GetArrayValue(j)
+						s = s & prefix & "    " & RenderArrayElement(child.GetArrayValue(j)) & FND.CRLF
 					Next
-					s = s + prefix + child.key + ": [" + arrayStr + "]" + FND.CRLF
-					
+					s = s & prefix & "]" & FND.CRLF
 				ElseIf child.nodeType = APON_BLOCK Then
-					s = s + prefix + child.key + ": {" + FND.CRLF
-					s = s + BuildBlockString(child, indent + 1)
-					s = s + prefix + "}" + FND.CRLF
+					s = s & prefix & RenderKeyWithType(child) & ": {" & FND.CRLF
+					s = s & BuildBlockString(child, indent + 1)
+					s = s & prefix & "}" & FND.CRLF
 				End If
 			Next
-			
 			Return s
+		End Function
+		
+		' SINGLE_LINE("sep"=" ", "delim"=", ") / COMPACT("","," ") 공용 직렬화
+		Private Function BuildSingleLine(node As AponNode, sep As String, delim As String) As String
+			Dim i As Integer
+			Dim j As Integer
+			Dim s As String
+			Dim inner As String
+			Dim child As AponNode
+			s = ""
+			If node.nodeType = APON_ARRAY Then
+				s = "[" & sep
+				For j = 0 To node.arrayCount - 1
+					If j > 0 Then
+						s = s & delim
+					End If
+					s = s & RenderArrayElement(node.GetArrayValue(j))
+				Next
+				s = s & sep & "]"
+				Return s
+			End If
+			For i = 0 To node.childCount - 1
+				child = node.GetChildByIndex(i)
+				If i > 0 Then
+					s = s & delim
+				End If
+				If child.nodeType = APON_VALUE Then
+					s = s & RenderKeyWithType(child) & ":" & sep & RenderValue(child.value)
+				ElseIf child.nodeType = APON_TEXT Then
+					' text → escaped single-line string
+					s = s & RenderKeyWithType(child) & ":" & sep & """" & EscapeQuoted(child.value) & """"
+				ElseIf child.nodeType = APON_ARRAY Then
+					inner = "[" & sep
+					For j = 0 To child.arrayCount - 1
+						If j > 0 Then
+							inner = inner & delim
+						End If
+						inner = inner & RenderArrayElement(child.GetArrayValue(j))
+					Next
+					inner = inner & sep & "]"
+					s = s & RenderKeyWithType(child) & ":" & sep & inner
+				ElseIf child.nodeType = APON_BLOCK Then
+					s = s & RenderKeyWithType(child) & ":" & sep & "{" & sep & BuildSingleLine(child, sep, delim) & sep & "}"
+				End If
+			Next
+			Return s
+		End Function
+		
+		' 값이 따옴표로 감싸져야 하는지 판단 (공식 APON 규칙)
+		Private Function NeedsQuoting(v As String) As Boolean
+			Dim n As Integer
+			Dim i As Integer
+			Dim c As String
+			Dim first As String
+			Dim last As String
+			n = Len(v)
+			If n = 0 Then
+				Return True
+			End If
+			first = Mid(v, 1, 1)
+			last = Mid(v, n, 1)
+			If first = " " Or first = Chr(9) Or first = "{" Or first = "[" Or first = "(" Or first = "#" Or first = """" Then
+				Return True
+			End If
+			If last = " " Or last = Chr(9) Then
+				Return True
+			End If
+			For i = 1 To n
+				c = Mid(v, i, 1)
+				If c = """" Or c = "\" Or c = "#" Or c = "," Or c = Chr(10) Or c = Chr(13) Then
+					Return True
+				End If
+			Next
+			Return False
+		End Function
+		
+		' 따옴표 안에서의 이스케이프 적용
+		Private Function EscapeQuoted(v As String) As String
+			Dim i As Integer
+			Dim c As String
+			Dim r As String
+			r = ""
+			For i = 1 To Len(v)
+				c = Mid(v, i, 1)
+				If c = "\" Then
+					r = r & "\\"
+				ElseIf c = """" Then
+					r = r & "\" & """"
+				ElseIf c = Chr(10) Then
+					r = r & "\n"
+				ElseIf c = Chr(13) Then
+					r = r & "\r"
+				ElseIf c = Chr(9) Then
+					r = r & "\t"
+				Else
+					r = r & c
+				End If
+			Next
+			Return r
+		End Function
+		
+		' 스칼라 값 렌더 (필요 시 따옴표 감싸기)
+		Private Function RenderValue(v As String) As String
+			If NeedsQuoting(v) Then
+				Return """" & EscapeQuoted(v) & """"
+			End If
+			Return v
+		End Function
+		
+		' key 또는 key(type) 렌더
+		Private Function RenderKeyWithType(child As AponNode) As String
+			If Len(child.typeHint) > 0 Then
+				Return child.key & "(" & child.typeHint & ")"
+			End If
+			Return child.key
+		End Function
+		
+		' 배열 원소 렌더. 중첩 블록/배열은 원시 텍스트 그대로 출력.
+		Private Function RenderArrayElement(v As String) As String
+			Dim first As String
+			If Len(v) = 0 Then
+				Return """" & """"
+			End If
+			first = Mid(v, 1, 1)
+			If first = "{" Or first = "[" Then
+				Return v
+			End If
+			Return RenderValue(v)
+		End Function
+		
+		' text 노드의 내용을 '|' 접두 라인으로 렌더
+		Private Function RenderTextLines(txt As String, indent As Integer) As String
+			Dim prefix As String
+			Dim i As Integer
+			Dim n As Integer
+			Dim lineStart As Integer
+			Dim c As String
+			Dim line As String
+			Dim result As String
+			prefix = ""
+			For i = 0 To indent - 1
+				prefix = prefix & "    "
+			Next
+			result = ""
+			n = Len(txt)
+			lineStart = 1
+			i = 1
+			While i <= n
+				c = Mid(txt, i, 1)
+				If c = Chr(10) Then
+					line = Mid(txt, lineStart, i - lineStart)
+					If Len(line) > 0 And Mid(line, Len(line), 1) = Chr(13) Then
+						line = Mid(line, 1, Len(line) - 1)
+					End If
+					result = result & prefix & "|" & line & FND.CRLF
+					lineStart = i + 1
+				End If
+				i = i + 1
+			End While
+			If lineStart <= n Then
+				line = Mid(txt, lineStart, n - lineStart + 1)
+				If Len(line) > 0 And Mid(line, Len(line), 1) = Chr(13) Then
+					line = Mid(line, 1, Len(line) - 1)
+				End If
+				result = result & prefix & "|" & line & FND.CRLF
+			End If
+			Return result
 		End Function
 		
 	End Class

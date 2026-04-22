@@ -5,5 +5,5 @@
 	"gpl.controller.consolePort": 1403,
 	"gpl.controller.timeoutMs": 10000,
 	"gpl.controller.ftpBasePath": "/GPL",
-	"gpl.controller.threadPollIntervalMs": 500
+	"gpl.controller.threadPollIntervalMs": 5000
 }
