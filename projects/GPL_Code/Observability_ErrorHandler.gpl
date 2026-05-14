@@ -1,5 +1,5 @@
 ' Last Update 2026/03/04 17:30
-Module OBS ' Observability_ErrorHandler VER 1.0.2
+Module OBS ' Observability_ErrorHandler VER 1.0.3
 	' [의존성 모듈]
 	' - Concurrency_SpinLock.gpl   (Module SNC): SpinLock 클래스 사용
 	' - Parsing_StringUtils.gpl(Module PRS): PRS.LastIndexOfChar 사용
@@ -8,7 +8,8 @@ Module OBS ' Observability_ErrorHandler VER 1.0.2
 	Private Const logFilePath As String = "/ROMDISK/tmp/Robot.log"
 	Private Const logFlushEveryLines As Integer = 16
 	Private Const logFlushIntervalMs As Integer = 300
-	Private Const includeThreadNameInPrefix As Integer = 0
+	' 스레드 이름 prefix 포함 여부 (0=OFF, 1=ON). SetIncludeThreadName()으로 변경.
+	Private Dim includeThreadNameInPrefix As Integer
 	' 파일 로그 토글 (0=OFF, 1=ON). 기본값 OFF. SetFileLogEnabled()로 변경.
 	Private Dim fileLogEnabled As Integer
 	Private Dim logWriteLock As New SpinLock
@@ -216,6 +217,21 @@ Module OBS ' Observability_ErrorHandler VER 1.0.2
 	' 현재 파일 로그 활성화 상태를 반환한다.
 	Public Function GetFileLogEnabled() As Integer
 		GetFileLogEnabled = fileLogEnabled
+	End Function
+
+	' 로그 prefix에 스레드 이름을 포함할지 설정한다. 기본값은 OFF(0).
+	' 멀티스레드 환경에서 TCPCOM0, TCPCOM1 등 스레드 식별에 유용.
+	Public Sub SetIncludeThreadName(ByVal enabled As Integer)
+		If enabled <> 0 Then
+			includeThreadNameInPrefix = 1
+		Else
+			includeThreadNameInPrefix = 0
+		End If
+	End Sub
+
+	' 현재 스레드 이름 포함 여부를 반환한다.
+	Public Function GetIncludeThreadName() As Integer
+		GetIncludeThreadName = includeThreadNameInPrefix
 	End Function
 
 	' 로그 sink를 등록한다. 최대 SINK_MAX개까지 등록 가능.

@@ -1,6 +1,7 @@
 'Created: 9/10/2024 12:17:50 PM
 'Reworked: 2026/05/08 (전체 모듈 종합 기능 테스트 + RC1403 heartbeat 임시 테스트)
-Module ORCH_Main ' ORCH_Main VER 1.1.2
+'Updated: 2026/05/14 (DBG.SetEnabled + OBS.SetIncludeThreadName 기동 초기화 + TestDBG 추가)
+Module ORCH_Main ' ORCH_Main VER 1.1.4
 
 	' ============================================================
 	' MAIN: 전체 모듈 테스트 순차 실행
@@ -10,6 +11,11 @@ Module ORCH_Main ' ORCH_Main VER 1.1.2
 		Dim totalFail As Integer
 		totalPass = 0
 		totalFail = 0
+
+		' 디버그 텔레메트리 활성화 (재배포 없이 런타임 진단 가능)
+		DBG.SetEnabled(1)
+		' 멀티스레드 로그에 스레드 이름 포함 (TCPCOM0, TCPCOM1 등 스레드 식별)
+		OBS.SetIncludeThreadName(1)
 
 		cehLog("=== MODULE TEST SUITE START ===", "MAIN")
 		cehLog("timestamp=" & FND.timeString(), "MAIN")
@@ -34,6 +40,8 @@ Module ORCH_Main ' ORCH_Main VER 1.1.2
 		TestMultiDimPattern()
 		TestAponTextAndEdges()
 		TestAponCoverage()
+		' 9. Debug_Telemetry (DBG)
+		TestDBG(totalPass, totalFail)
 
 		cehLog("=== MODULE TEST SUITE END  PASS=" & CStr(totalPass) & "  FAIL=" & CStr(totalFail) & " ===", "MAIN")
 
@@ -410,8 +418,130 @@ Module ORCH_Main ' ORCH_Main VER 1.1.2
 	' ─── AponStore 기능은 TestStoreCompare / TestAponTextAndEdges / TestAponCoverage 에서 커버 ───
 	' (TestApon legacy stub removed in VER 1.1.0)
 
+	' ============================================================
+	' 9. Debug_Telemetry (DBG)
+	' ============================================================
+	Private Sub TestDBG(ByRef pass As Integer, ByRef fail As Integer)
+		Dim ctx As String
+		Dim r1 As String
+		Dim r2 As String
+		Dim handled As Integer
+		ctx = "TestDBG"
+		cehLog("--- [DBG] Debug_Telemetry ---", ctx)
+
+		' SetEnabled / GetEnabled
+		DBG.SetEnabled(0)
+		Check("DBG.SetEnabled(0) GetEnabled=0", CInt(DBG.GetEnabled() = 0), pass, fail)
+		DBG.SetEnabled(1)
+		Check("DBG.SetEnabled(1) GetEnabled=1", CInt(DBG.GetEnabled() = 1), pass, fail)
+
+		' Watch Registry: 초기 상태
+		DBG.ClearWatches()
+		Check("DBG.ClearWatches count=0", CInt(DBG.GetWatchCount() = 0), pass, fail)
+
+		' SetWatch 신규 등록
+		DBG.SetWatch("speed", "1200")
+		DBG.SetWatch("accel", "500")
+		Check("DBG.SetWatch count=2", CInt(DBG.GetWatchCount() = 2), pass, fail)
+
+		' SetWatch 업데이트 (동일 이름 재등록 → count 불변)
+		DBG.SetWatch("speed", "1500")
+		Check("DBG.SetWatch update count=2", CInt(DBG.GetWatchCount() = 2), pass, fail)
+
+		' EmitSnapshot – 예외 없이 호출 가능 여부 확인
+		Dim snapOk As Integer
+		snapOk = 0
+		Dim snapEx As Exception
+		Try
+			DBG.EmitSnapshot(ctx)
+			snapOk = 1
+		Catch snapEx
+			OBS.cehLogEx(snapEx, ctx & ".EmitSnapshot")
+		End Try
+		Check("DBG.EmitSnapshot no-throw", snapOk, pass, fail)
+
+		' Span Timing: 초기 상태
+		DBG.ClearSpans()
+		Check("DBG.ClearSpans count=0", CInt(DBG.GetSpanCount() = 0), pass, fail)
+
+		' SpanBegin / SpanEnd – 등록 및 count 증가 확인
+		DBG.SpanBegin("testSpan")
+		Thread.Sleep(10)
+		DBG.SpanEnd("testSpan")
+		Check("DBG.SpanEnd span_count=1", CInt(DBG.GetSpanCount() = 1), pass, fail)
+
+		' 두 번째 SpanEnd → count 증가 (같은 span 재사용)
+		DBG.SpanBegin("testSpan")
+		Thread.Sleep(5)
+		DBG.SpanEnd("testSpan")
+
+		' EmitSpans – 예외 없이 호출 가능 여부 확인
+		Dim spansOk As Integer
+		spansOk = 0
+		Dim spansEx As Exception
+		Try
+			DBG.EmitSpans(ctx)
+			spansOk = 1
+		Catch spansEx
+			OBS.cehLogEx(spansEx, ctx & ".EmitSpans")
+		End Try
+		Check("DBG.EmitSpans no-throw", spansOk, pass, fail)
+
+		' TCP 명령 라우팅: DBG:STATUS
+		r1 = ""
+		r2 = ""
+		handled = DBG.TryHandleCommand("DBG:STATUS", "", "", r1, r2)
+		Check("DBG.TryHandleCommand STATUS handled=1", CInt(handled = 1), pass, fail)
+		Check("DBG.TryHandleCommand STATUS reply not empty", CInt(r1 <> ""), pass, fail)
+
+		' TCP 명령 라우팅: DBG:SNAP
+		r1 = ""
+		r2 = ""
+		handled = DBG.TryHandleCommand("DBG:SNAP", "", "", r1, r2)
+		Check("DBG.TryHandleCommand SNAP handled=1", CInt(handled = 1), pass, fail)
+
+		' TCP 명령 라우팅: DBG:WATCH
+		r1 = ""
+		r2 = ""
+		handled = DBG.TryHandleCommand("DBG:WATCH", "testKey testVal", "TESTKEY TESTVAL", r1, r2)
+		Check("DBG.TryHandleCommand WATCH handled=1", CInt(handled = 1), pass, fail)
+
+		' TCP 명령 라우팅: DBG:VERBOSE
+		r1 = ""
+		r2 = ""
+		handled = DBG.TryHandleCommand("DBG:VERBOSE", "1", "1", r1, r2)
+		Check("DBG.TryHandleCommand VERBOSE handled=1", CInt(handled = 1), pass, fail)
+
+		' TCP 명령 라우팅: DBG:CLEAR
+		r1 = ""
+		r2 = ""
+		handled = DBG.TryHandleCommand("DBG:CLEAR", "", "", r1, r2)
+		Check("DBG.TryHandleCommand CLEAR handled=1", CInt(handled = 1), pass, fail)
+		Check("DBG.CLEAR watch=0", CInt(DBG.GetWatchCount() = 0), pass, fail)
+		Check("DBG.CLEAR span=0",  CInt(DBG.GetSpanCount()  = 0), pass, fail)
+
+		' 비DBG 명령은 0(not handled) 반환
+		r1 = ""
+		r2 = ""
+		handled = DBG.TryHandleCommand("PING", "", "", r1, r2)
+		Check("DBG.TryHandleCommand non-DBG=0", CInt(handled = 0), pass, fail)
+
+		' m_enabled=0 시 SetWatch no-op 확인
+		DBG.SetEnabled(0)
+		DBG.SetWatch("shouldNotAdd", "x")
+		Check("DBG.SetWatch when disabled no-op count=0", CInt(DBG.GetWatchCount() = 0), pass, fail)
+		' 테스트 후 재활성화
+		DBG.SetEnabled(1)
+
+		' OBS.SetIncludeThreadName / GetIncludeThreadName
+		OBS.SetIncludeThreadName(0)
+		Check("OBS.SetIncludeThreadName(0) get=0", CInt(OBS.GetIncludeThreadName() = 0), pass, fail)
+		OBS.SetIncludeThreadName(1)
+		Check("OBS.SetIncludeThreadName(1) get=1", CInt(OBS.GetIncludeThreadName() = 1), pass, fail)
+	End Sub
+
 	' ─── AponStore vs DatStore 파일 저장 비교 테스트 (복합 데이터) ───
-	' TEMP_PREFIX (/ROMDISK/temp/) 에 저장하여 Flash 보호
+	' TEMP_PREFIX (/ROMDISK/tmp/) 에 저장하여 Flash 보호
 	Sub TestStoreCompare()
 		Dim ctx As String
 		Dim passCount As Integer

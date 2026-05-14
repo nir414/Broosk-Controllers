@@ -19,7 +19,7 @@
 ' 사용 예 (Orchestration_Main 등 엔트리 포인트에서):
 '   Dim tcp As New TcpCommunication("192.168.0.1", "5000")
 '   OBS.RegisterLogSink(AddressOf NET.ForwardLogLine)
-Module NET ' Networking_TcpServer VER 1.0.0
+Module NET ' Networking_TcpServer VER 1.0.1
 	
 	
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -333,8 +333,12 @@ Module NET ' Networking_TcpServer VER 1.0.0
 	
 	' TryHandleCustom: 커스텀 명령 처리 훅
 	' Return: 1=handled, 0=not handled (기본 처리로 진행)
+	' DBG 모듈의 TCP 명령(DBG:SNAP / DBG:WATCH / DBG:CLEAR / DBG:VERBOSE / DBG:STATUS)을 라우팅한다.
 	Public Function TryHandleCustom(ByVal cmd As String, ByVal args As String, ByVal argsUpper As String, ByVal rawLine As String, ByVal debugOn As Integer, ByRef echoMode As Boolean, ByRef shouldEnqueue As Integer, ByRef enqueueText As String, ByRef shouldEcho As Integer, ByRef echoText As String, ByRef replyLine1 As String, ByRef replyLine2 As String) As Integer
-		' Default: no custom commands
+		If DBG.TryHandleCommand(cmd, args, argsUpper, replyLine1, replyLine2) = 1 Then
+			TryHandleCustom = 1
+			Exit Function
+		End If
 		TryHandleCustom = 0
 	End Function
 	

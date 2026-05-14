@@ -3,7 +3,7 @@
 'Notes:
 ' - LEGACY ModuleName(Storage_File_Manager) 대체 구현
 ' - 신규/개선 코드는 CFS 모듈명을 사용
-Module PST ' Persistence_FileStore VER 1.0.0
+Module PST ' Persistence_FileStore VER 1.0.4
 
 	' 저장 결과 상수
 	Public Const SAVE_SUCCESS As Integer = 1
@@ -16,31 +16,28 @@ Module PST ' Persistence_FileStore VER 1.0.0
 	' 파일 시스템 경로 상수
 	Public Const FLASH_PREFIX As String = "/flash/"
 	Public Const ROMDISK_PREFIX As String = "/ROMDISK/"
-	Public Const TEMP_PREFIX As String = "/ROMDISK/temp/"
+	Public Const TEMP_PREFIX As String = "/ROMDISK/tmp/"  ' OBS 로그 디렉토리와 통합 (/ROMDISK/temp/ 제거)
+
+	' 임시 파일 경로 생성용 내부 카운터 (타임스탬프 충돌 방지)
+	Private Dim tempSeq As Integer
+	Private Dim tempSeqLock As New SpinLock
 
 	'=========================
 	' Public API
 	'=========================
 	Public Function SafeSaveFile(path As String, content As String, useBackup As Integer) As Integer
 		If path Is Nothing Then
-			OBS.cehLog("ERR: Invalid path or empty content", "PST.SafeSaveFile")
-			SafeSaveFile = SAVE_ERROR_PATH_INVALID
-			Exit Function
-		End If
-		If content Is Nothing Then
-			OBS.cehLog("ERR: Invalid path or empty content", "PST.SafeSaveFile")
+			OBS.cehLog("ERR: Invalid path (Nothing)", "PST.SafeSaveFile")
 			SafeSaveFile = SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
 		If path = "" Then
-			OBS.cehLog("ERR: Invalid path or empty content", "PST.SafeSaveFile")
+			OBS.cehLog("ERR: Invalid path (empty string)", "PST.SafeSaveFile")
 			SafeSaveFile = SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
-		If content = "" Then
-			OBS.cehLog("ERR: Invalid path or empty content", "PST.SafeSaveFile")
-			SafeSaveFile = SAVE_ERROR_PATH_INVALID
-			Exit Function
+		If content Is Nothing Then
+			content = ""
 		End If
 
 		If FileExists(path) Then
@@ -88,24 +85,9 @@ Module PST ' Persistence_FileStore VER 1.0.0
 			End If
 
 			Dim reader As StreamReader
-			Dim content As String
-			Dim line As String
-			Dim isFirstLine As Integer
-
 			reader = New StreamReader(path)
-			content = ""
-			isFirstLine = 1
-			Do While reader.Peek() >= 0
-				line = reader.ReadLine()
-				If isFirstLine = 1 Then
-					isFirstLine = 0
-					content = line
-				Else
-					content = content & FND.CRLF & line
-				End If
-			Loop
+			ReadFileContent = reader.ReadToEnd()  ' 원본 줄 끝(CRLF/LF) 그대로 보존
 			reader.Close()
-			ReadFileContent = content
 		Catch ex
 			OBS.cehLogEx(ex, "PST.ReadFileContent | Path: " & path)
 			ReadFileContent = ""
@@ -278,13 +260,44 @@ Module PST ' Persistence_FileStore VER 1.0.0
 	Private Function GenerateTempPath(originalPath As String) As String
 		Dim fileName As String
 		Dim pos As Integer
+		Dim seq As Integer
 		pos = FindLastSlashPos(originalPath)
 		If pos > 0 Then
 			fileName = Mid(originalPath, pos + 1)
 		Else
 			fileName = originalPath
 		End If
-		GenerateTempPath = TEMP_PREFIX & fileName & "_" & FND.timeString() & ".tmp"
+		' 순번 카운터: 같은 초 안에 여러 저장이 겹쳐도 tmp 파일명이 충돌하지 않도록 보장
+		tempSeqLock.Acquire()
+		tempSeq = tempSeq + 1
+		seq = tempSeq
+		tempSeqLock.Release()
+		GenerateTempPath = TEMP_PREFIX & fileName & "_" & FND.timeString() & "_" & CStr(seq) & ".tmp"
+	End Function
+
+	' 끝의 '/'를 제거한 정규화 경로 반환 (루트 '/'는 유지)
+	Private Function NormalizeDirPath(path As String) As String
+		Dim normalized As String
+		normalized = path
+		While Len(normalized) > 1 And Mid(normalized, Len(normalized), 1) = "/"
+			normalized = Mid(normalized, 1, Len(normalized) - 1)
+		End While
+		NormalizeDirPath = normalized
+	End Function
+
+	' 제어기 기본 디렉터리(항상 존재) 여부
+	Private Function IsKnownStableDirectory(dirPath As String) As Integer
+		Dim normalized As String
+		normalized = NormalizeDirPath(dirPath)
+		If normalized = "/flash" Then
+			IsKnownStableDirectory = 1
+		ElseIf normalized = "/ROMDISK" Then
+			IsKnownStableDirectory = 1
+		ElseIf normalized = "/ROMDISK/tmp" Then
+			IsKnownStableDirectory = 1
+		Else
+			IsKnownStableDirectory = 0
+		End If
 	End Function
 
 	Private Function EnsureDirectory(filePath As String) As Integer
@@ -295,11 +308,14 @@ Module PST ' Persistence_FileStore VER 1.0.0
 			pos = FindLastSlashPos(filePath)
 			If pos > 0 Then
 				dirPath = Mid(filePath, 1, pos - 1)
-				File.CreateDirectory(dirPath)
+				If IsKnownStableDirectory(dirPath) = 0 Then
+					File.CreateDirectory(dirPath)
+				End If
 			End If
 			EnsureDirectory = 1
 		Catch ex
 			If ex.ErrorCode = -510 Then
+				' 디렉터리가 이미 존재하는 경우: 의도된 idempotent 성공 처리
 				EnsureDirectory = 1
 			Else
 				Console.WriteLine(FND.timeString() & " [" & Thread.CurrentThread.Name & "] ERR(" & CStr(ex.ErrorCode) & "): PST.EnsureDirectory - " & ex.Message() & " | Path: " & filePath)

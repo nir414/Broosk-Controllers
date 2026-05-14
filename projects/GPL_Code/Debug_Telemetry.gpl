@@ -1,0 +1,366 @@
+'Created: 2026/05/14
+'Purpose: 런타임 디버그 텔레메트리
+' - Watch Registry: 변수 이름/값 쌍을 런타임에 등록·조회 (재배포 없이 상태 확인)
+' - Span Timing: 구간 타이밍 측정 (성능 병목 식별)
+' - TCP 명령 라우팅: DBG:SNAP / DBG:WATCH / DBG:CLEAR / DBG:VERBOSE / DBG:STATUS
+' - 마스터 토글: SetEnabled(0) 시 모든 Set*/Span* 즉시 반환 (프로덕션 오버헤드 0)
+'
+'Requires:
+' - Concurrency_SpinLock.gpl  (Module SNC): SpinLock 클래스
+' - Observability_ErrorHandler.gpl (Module OBS): cehLog
+' - Foundation_Utils.gpl      (Module FND): timeString
+' - Parsing_StringUtils.gpl   (Module PRS): StartsWith, SplitOnce, SafeTrim
+'Used by:
+' - Networking_TcpServer (Module NET): TryHandleCustom → TryHandleCommand
+' - Orchestration_Main: DBG.SetEnabled(1) 기동 시 활성화
+'
+' TCP 명령 사용 예 (telnet / 확장 터미널에서):
+'   DBG:SNAP             → Watch Registry + Span 전체 덤프
+'   DBG:WATCH speed 1200 → Watch에 speed=1200 수동 주입
+'   DBG:CLEAR            → Watch + Span 전체 초기화
+'   DBG:VERBOSE 1        → 상세 로그 ON
+'   DBG:STATUS           → 모듈 활성화/Watch 수/Span 수 출력
+Module DBG ' Debug_Telemetry VER 1.0.0
+
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''''' CONSTANTS '''''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+	Private Const WATCH_MAX As Integer = 32
+	Private Const SPAN_MAX  As Integer = 16
+
+
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''''''' STATE '''''''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+	' 마스터 토글 (0=OFF: 모든 Set*/Span* 즉시 반환)
+	Private Dim m_enabled As Integer
+	' 상세 로그 토글 (1=ON: Span begin/end 마다 로그 출력)
+	Private Dim m_verbose As Integer
+
+	' --- Watch Registry ---
+	Private Dim m_watchLock   As New SpinLock
+	Private Dim m_watchNames  (WATCH_MAX - 1) As String
+	Private Dim m_watchValues (WATCH_MAX - 1) As String
+	Private Dim m_watchCount  As Integer
+
+	' --- Span Timing ---
+	Private Dim m_spanLock    As New SpinLock
+	Private Dim m_spanNames   (SPAN_MAX - 1) As String
+	Private Dim m_spanStartMs (SPAN_MAX - 1) As Double
+	Private Dim m_spanLastMs  (SPAN_MAX - 1) As Double  ' 마지막 SpanEnd 경과
+	Private Dim m_spanTotalMs (SPAN_MAX - 1) As Double  ' 누적 경과
+	Private Dim m_spanCount   (SPAN_MAX - 1) As Integer ' SpanEnd 호출 횟수
+	Private Dim m_spanSlots   As Integer                 ' 등록된 span 이름 수
+
+
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	''''''''''''''''''''''''''' INIT ''''''''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+	' 마스터 토글을 설정한다. 0=OFF(기본), 1=ON.
+	' OFF 시 SetWatch/SpanBegin/SpanEnd 모두 즉시 반환 (오버헤드 없음).
+	Public Sub SetEnabled(ByVal enabled As Integer)
+		If enabled <> 0 Then
+			m_enabled = 1
+		Else
+			m_enabled = 0
+		End If
+	End Sub
+
+	' 현재 활성화 상태를 반환한다.
+	Public Function GetEnabled() As Integer
+		GetEnabled = m_enabled
+	End Function
+
+	' 상세 로그 토글 (1=ON: SpanBegin/End 시 로그 출력).
+	Public Sub SetVerbose(ByVal verbose As Integer)
+		If verbose <> 0 Then
+			m_verbose = 1
+		Else
+			m_verbose = 0
+		End If
+	End Sub
+
+
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	''''''''''''''''''''''''' WATCH API ''''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+	' 변수 이름/값 쌍을 Watch Registry에 등록하거나 업데이트한다.
+	' 동일 이름이 이미 존재하면 값을 덮어쓴다.
+	' m_enabled=0 이면 즉시 반환 (오버헤드 없음).
+	Public Sub SetWatch(ByVal name As String, ByVal value As String)
+		Dim i As Integer
+		Dim slot As Integer
+		If m_enabled = 0 Then Exit Sub
+		If name Is Nothing Then name = ""
+		If value Is Nothing Then value = ""
+		If name = "" Then Exit Sub
+
+		m_watchLock.Acquire()
+		' 기존 엔트리 업데이트
+		slot = -1
+		For i = 0 To m_watchCount - 1
+			If Not m_watchNames(i) Is Nothing Then
+				If m_watchNames(i) = name Then
+					slot = i
+					Exit For
+				End If
+			End If
+		Next
+		If slot >= 0 Then
+			m_watchValues(slot) = value
+		ElseIf m_watchCount < WATCH_MAX Then
+			m_watchNames(m_watchCount) = name
+			m_watchValues(m_watchCount) = value
+			m_watchCount += 1
+		End If
+		' 슬롯이 가득 찬 경우 조용히 무시 (오버헤드 최소화)
+		m_watchLock.Release()
+	End Sub
+
+	' Watch Registry 전체를 초기화한다.
+	Public Sub ClearWatches()
+		Dim i As Integer
+		m_watchLock.Acquire()
+		For i = 0 To WATCH_MAX - 1
+			m_watchNames(i) = Nothing
+			m_watchValues(i) = Nothing
+		Next
+		m_watchCount = 0
+		m_watchLock.Release()
+	End Sub
+
+	' 현재 등록된 Watch 항목 수를 반환한다.
+	Public Function GetWatchCount() As Integer
+		GetWatchCount = m_watchCount
+	End Function
+
+	' 등록된 모든 Watch 항목을 OBS.cehLog로 출력한다.
+	Public Sub EmitSnapshot(ByVal context As String)
+		Dim i As Integer
+		Dim name As String
+		Dim value As String
+		If context Is Nothing Then context = "DBG.EmitSnapshot"
+		OBS.cehLog("[DBG:SNAP] watch_count=" & CStr(m_watchCount), context)
+		m_watchLock.Acquire()
+		For i = 0 To m_watchCount - 1
+			name = m_watchNames(i)
+			value = m_watchValues(i)
+			If name Is Nothing Then name = ""
+			If value Is Nothing Then value = ""
+			OBS.cehLog("  watch[" & CStr(i) & "] " & name & "=" & value, context)
+		Next
+		m_watchLock.Release()
+	End Sub
+
+
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''''' SPAN API '''''''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+	' name에 해당하는 span 슬롯 인덱스를 찾거나 새로 할당한다.
+	' 슬롯이 가득 차면 -1 반환. (호출자가 spanLock을 보유한 상태에서 호출)
+	Private Function FindOrAllocSpan(ByVal name As String) As Integer
+		Dim i As Integer
+		If name Is Nothing Then name = ""
+		For i = 0 To m_spanSlots - 1
+			If Not m_spanNames(i) Is Nothing Then
+				If m_spanNames(i) = name Then
+					FindOrAllocSpan = i
+					Exit Function
+				End If
+			End If
+		Next
+		If m_spanSlots < SPAN_MAX Then
+			m_spanNames(m_spanSlots) = name
+			m_spanStartMs(m_spanSlots) = 0
+			m_spanLastMs(m_spanSlots) = 0
+			m_spanTotalMs(m_spanSlots) = 0
+			m_spanCount(m_spanSlots) = 0
+			i = m_spanSlots
+			m_spanSlots += 1
+			FindOrAllocSpan = i
+		Else
+			FindOrAllocSpan = -1
+		End If
+	End Function
+
+	' 구간 타이밍을 시작한다.
+	' m_enabled=0 이면 즉시 반환.
+	Public Sub SpanBegin(ByVal name As String)
+		Dim slot As Integer
+		Dim nowMs As Double
+		If m_enabled = 0 Then Exit Sub
+		If name Is Nothing Then name = ""
+		If name = "" Then Exit Sub
+
+		nowMs = Controller.Timer(1) * 1000
+		m_spanLock.Acquire()
+		slot = FindOrAllocSpan(name)
+		If slot >= 0 Then
+			m_spanStartMs(slot) = nowMs
+		End If
+		m_spanLock.Release()
+
+		If m_verbose = 1 And slot >= 0 Then
+			OBS.cehLog("[DBG:SPAN] begin " & name, "DBG.SpanBegin")
+		End If
+	End Sub
+
+	' 구간 타이밍을 종료하고 경과 시간을 누적한다.
+	' m_enabled=0 이면 즉시 반환.
+	Public Sub SpanEnd(ByVal name As String)
+		Dim slot As Integer
+		Dim nowMs As Double
+		Dim elapsed As Double
+		Dim startMs As Double
+		If m_enabled = 0 Then Exit Sub
+		If name Is Nothing Then name = ""
+		If name = "" Then Exit Sub
+
+		nowMs = Controller.Timer(1) * 1000
+		m_spanLock.Acquire()
+		slot = FindOrAllocSpan(name)
+		If slot >= 0 Then
+			startMs = m_spanStartMs(slot)
+			If startMs > 0 Then
+				elapsed = nowMs - startMs
+				If elapsed < 0 Then elapsed = 0
+				m_spanLastMs(slot) = elapsed
+				m_spanTotalMs(slot) = m_spanTotalMs(slot) + elapsed
+				m_spanCount(slot) = m_spanCount(slot) + 1
+				m_spanStartMs(slot) = 0
+			End If
+		End If
+		m_spanLock.Release()
+
+		If m_verbose = 1 And slot >= 0 Then
+			OBS.cehLog("[DBG:SPAN] end " & name & " elapsed=" & CStr(CInt(elapsed)) & "ms", "DBG.SpanEnd")
+		End If
+	End Sub
+
+	' 구간 타이밍 전체를 초기화한다.
+	Public Sub ClearSpans()
+		Dim i As Integer
+		m_spanLock.Acquire()
+		For i = 0 To SPAN_MAX - 1
+			m_spanNames(i) = Nothing
+			m_spanStartMs(i) = 0
+			m_spanLastMs(i) = 0
+			m_spanTotalMs(i) = 0
+			m_spanCount(i) = 0
+		Next
+		m_spanSlots = 0
+		m_spanLock.Release()
+	End Sub
+
+	' 현재 등록된 Span 수를 반환한다.
+	Public Function GetSpanCount() As Integer
+		GetSpanCount = m_spanSlots
+	End Function
+
+	' 등록된 모든 Span 항목을 OBS.cehLog로 출력한다.
+	Public Sub EmitSpans(ByVal context As String)
+		Dim i As Integer
+		Dim name As String
+		Dim cnt As Integer
+		Dim last As Double
+		Dim avg As Double
+		If context Is Nothing Then context = "DBG.EmitSpans"
+		OBS.cehLog("[DBG:SPAN] span_count=" & CStr(m_spanSlots), context)
+		m_spanLock.Acquire()
+		For i = 0 To m_spanSlots - 1
+			name = m_spanNames(i)
+			cnt  = m_spanCount(i)
+			last = m_spanLastMs(i)
+			If name Is Nothing Then name = ""
+			If cnt > 0 Then
+				avg = m_spanTotalMs(i) / CDbl(cnt)
+			Else
+				avg = 0
+			End If
+			OBS.cehLog("  span[" & CStr(i) & "] " & name & " last=" & CStr(CInt(last)) & "ms avg=" & CStr(CInt(avg)) & "ms count=" & CStr(cnt), context)
+		Next
+		m_spanLock.Release()
+	End Sub
+
+
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''' TCP COMMAND ROUTING (via NET) ''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+	' NET.TryHandleCustom에서 호출한다.
+	' cmd/args/argsUpper: EvaluateLine에서 전달된 정규화 값
+	' replyLine1/replyLine2: TCP 응답 (ByRef)
+	' Return: 1=handled, 0=not handled
+	Public Function TryHandleCommand(ByVal cmd As String, ByVal args As String, ByVal argsUpper As String, ByRef replyLine1 As String, ByRef replyLine2 As String) As Integer
+		Dim name As String
+		Dim value As String
+		Dim splitOk As Integer
+		Dim left As String
+		Dim right As String
+
+		If cmd Is Nothing Then cmd = ""
+		If args Is Nothing Then args = ""
+
+		' DBG 명령은 "DBG:SUBCMD" 형태
+		If Not PRS.StartsWith(cmd, "DBG:") = 1 Then
+			TryHandleCommand = 0
+			Exit Function
+		End If
+
+		Dim subCmd As String
+		subCmd = cmd.Substring(4)  ' "DBG:" 이후
+		If subCmd Is Nothing Then subCmd = ""
+
+		If subCmd = "SNAP" Then
+			' DBG:SNAP → Watch + Span 전체 덤프
+			EmitSnapshot("DBG:SNAP")
+			EmitSpans("DBG:SNAP")
+			replyLine1 = "OK DBG:SNAP watch=" & CStr(m_watchCount) & " spans=" & CStr(m_spanSlots)
+
+		ElseIf subCmd = "WATCH" Then
+			' DBG:WATCH name value → SetWatch 수동 주입
+			splitOk = PRS.SplitOnce(args, " ", left, right)
+			If splitOk = 1 Then
+				name  = PRS.SafeTrim(left)
+				value = PRS.SafeTrim(right)
+				SetWatch(name, value)
+				replyLine1 = "OK DBG:WATCH " & name & "=" & value
+			Else
+				replyLine1 = "ERR DBG:WATCH expects: name value"
+			End If
+
+		ElseIf subCmd = "CLEAR" Then
+			' DBG:CLEAR → Watch + Span 전체 초기화
+			ClearWatches()
+			ClearSpans()
+			replyLine1 = "OK DBG:CLEAR"
+
+		ElseIf subCmd = "VERBOSE" Then
+			' DBG:VERBOSE 1|0
+			If argsUpper = "1" Or argsUpper = "ON" Then
+				SetVerbose(1)
+				replyLine1 = "OK DBG:VERBOSE=1"
+			ElseIf argsUpper = "0" Or argsUpper = "OFF" Then
+				SetVerbose(0)
+				replyLine1 = "OK DBG:VERBOSE=0"
+			Else
+				replyLine1 = "ERR DBG:VERBOSE expects 0|1"
+			End If
+
+		ElseIf subCmd = "STATUS" Then
+			' DBG:STATUS → 모듈 상태 요약
+			replyLine1 = "OK DBG:STATUS enabled=" & CStr(m_enabled) & " verbose=" & CStr(m_verbose) & " watches=" & CStr(m_watchCount) & " spans=" & CStr(m_spanSlots)
+
+		Else
+			replyLine1 = "ERR DBG: unknown subcommand '" & subCmd & "' (SNAP/WATCH/CLEAR/VERBOSE/STATUS)"
+		End If
+
+		TryHandleCommand = 1
+	End Function
+
+End Module
