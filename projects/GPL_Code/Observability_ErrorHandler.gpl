@@ -1,5 +1,5 @@
 ' Last Update 2026/03/04 17:30
-Module OBS ' Observability_ErrorHandler VER 1.0.0
+Module OBS ' Observability_ErrorHandler VER 1.0.2
 	' [의존성 모듈]
 	' - Concurrency_SpinLock.gpl   (Module SNC): SpinLock 클래스 사용
 	' - Parsing_StringUtils.gpl(Module PRS): PRS.LastIndexOfChar 사용
@@ -9,6 +9,8 @@ Module OBS ' Observability_ErrorHandler VER 1.0.0
 	Private Const logFlushEveryLines As Integer = 16
 	Private Const logFlushIntervalMs As Integer = 300
 	Private Const includeThreadNameInPrefix As Integer = 0
+	' 파일 로그 토글 (0=OFF, 1=ON). 기본값 OFF. SetFileLogEnabled()로 변경.
+	Private Dim fileLogEnabled As Integer
 	Private Dim logWriteLock As New SpinLock
 	Private Dim logDirInitLock As New SpinLock
 	Private Dim logDirInitialized As Integer
@@ -125,6 +127,7 @@ Module OBS ' Observability_ErrorHandler VER 1.0.0
 	Private Sub WriteLogFile(line As String)
 		Dim ex As Exception
 		Dim nowMs As Double
+		If fileLogEnabled <> 1 Then Exit Sub  ' 파일 로그 토글 OFF 시 즉시 반환
 		If line Is Nothing Then line = ""
 		If logFilePath Is Nothing Then Exit Sub
 		If logFilePath = "" Then Exit Sub
@@ -204,6 +207,16 @@ Module OBS ' Observability_ErrorHandler VER 1.0.0
 	' ========================================
 	' Sink 등록 API
 	' ========================================
+
+	' 파일 로그를 활성화(1) 또는 비활성화(0)한다. 기본값은 OFF(0).
+	Public Sub SetFileLogEnabled(enabled As Integer)
+		fileLogEnabled = enabled
+	End Sub
+
+	' 현재 파일 로그 활성화 상태를 반환한다.
+	Public Function GetFileLogEnabled() As Integer
+		GetFileLogEnabled = fileLogEnabled
+	End Function
 
 	' 로그 sink를 등록한다. 최대 SINK_MAX개까지 등록 가능.
 	Public Sub RegisterLogSink(sink As LogSinkSub)
@@ -305,7 +318,7 @@ Module OBS ' Observability_ErrorHandler VER 1.0.0
 					End Try
 				End If
 			Next
-			emitting = 0
+			Thread.TestAndSet(emitting, 0) ' 원자적 리셋 (단순 대입 시 멀티스레드 경쟁 조건 방지)
 		End If
 	End Sub
 

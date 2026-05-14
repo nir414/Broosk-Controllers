@@ -7,7 +7,7 @@
 ' - Substring 범위 검사 필수 (SafeSubstring)
 ' - 공백/주석 처리 유틸로 파싱 코드 간결화
 
-Module PRS ' Parsing_StringUtils VER 1.0.0
+Module PRS ' Parsing_StringUtils VER 1.0.1
 
 	' ========================================
 	' [0] Internal helpers (Nothing-safe)
@@ -623,11 +623,14 @@ Module PRS ' Parsing_StringUtils VER 1.0.0
 		For i = 1 To Len(jsonStr)
 			ch = Mid(jsonStr, i, 1)
 			
-			If (ch >= "0" And ch <= "9") Or (ch = "." And inNumber = 0) Or (ch = "-" And inNumber = 0) Then
+			If (ch >= "0" And ch <= "9") Or (ch = "-" And inNumber = 0) Then
+				' 새 숫자 시작 또는 숫자 내부 유지
 				If inNumber = 0 Then
 					count = count + 1
 					inNumber = 1
 				End If
+			ElseIf ch = "." And inNumber = 1 Then
+				' 소수점: 숫자 내부 — inNumber 유지 (재카운팅 방지)
 			Else
 				inNumber = 0
 			End If

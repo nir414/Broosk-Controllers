@@ -14,7 +14,7 @@
 'Used by:
 ' - ORCH_Main (예제/실사용), 기타 상위 비즈니스 로직
 
-Module DAT ' Format_DatStore VER 1.0.0
+Module DAT ' Format_DatStore VER 1.0.1
 
 	Public Class DatStore
 		Private Const MAX_ITEMS As Integer = 256
@@ -200,7 +200,8 @@ Module DAT ' Format_DatStore VER 1.0.0
 			Dim i As Integer
 			Dim key As String
 			Dim value As String
-			Dim alreadyWritten(MAX_ITEMS-1) As Integer
+			Dim alreadyWritten() As Integer
+			ReDim alreadyWritten(itemCount) ' itemCount 기준 동적 할당 (MAX_ITEMS 고정 크기 경계 초과 방지)
 			Dim j As Integer
 			Dim hasBlankAfterMetadata As Integer
 			Dim scanIndex As Integer

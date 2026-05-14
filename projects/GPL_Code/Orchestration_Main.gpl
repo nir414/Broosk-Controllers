@@ -1,130 +1,414 @@
 'Created: 9/10/2024 12:17:50 PM
-'Reworked: 12/17/2025 (sandbox repro only)
-Module ORCH_Main ' ORCH_Main VER 1.0.0
+'Reworked: 2026/05/08 (전체 모듈 종합 기능 테스트 + RC1403 heartbeat 임시 테스트)
+Module ORCH_Main ' ORCH_Main VER 1.1.2
+
+	' ============================================================
+	' MAIN: 전체 모듈 테스트 순차 실행
+	' ============================================================
 	Public Sub MAIN
-		Dim i As Integer
-		cehLog("Program start", "MAIN")
-		' TestCode-----------------------Start
+		Dim totalPass As Integer
+		Dim totalFail As Integer
+		totalPass = 0
+		totalFail = 0
+
+		cehLog("=== MODULE TEST SUITE START ===", "MAIN")
+		cehLog("timestamp=" & FND.timeString(), "MAIN")
+
+		' 1. Foundation_Utils (FND)
+		TestFND(totalPass, totalFail)
+		' 2. Concurrency_SpinLock (SNC)
+		TestSNC(totalPass, totalFail)
+		' 3. Concurrency_RingQueue (RNQ)
+		TestRNQ(totalPass, totalFail)
+		' 4. Parsing_StringUtils (PRS)
+		TestPRS(totalPass, totalFail)
+		' 5. Persistence_FileStore (PST)
+		TestPST(totalPass, totalFail)
+		' 6. Pipeline_AsyncSave (PIP)
+		TestPIP(totalPass, totalFail)
+		' 7. Format_DatStore (DAT)  -- CheckHelper 기반
+		TestDAT(totalPass, totalFail)
+		' 8. Format_Apon / AponStore 심층 테스트 (기존 테스트 모음 유지)
+		cehLog("--- [APN] Format_Apon (existing coverage) ---", "MAIN")
 		TestStoreCompare()
 		TestMultiDimPattern()
-		' TestCode-------------------------End
+		TestAponTextAndEdges()
+		TestAponCoverage()
 
-		cehLog("Program end", "MAIN")
+		cehLog("=== MODULE TEST SUITE END  PASS=" & CStr(totalPass) & "  FAIL=" & CStr(totalFail) & " ===", "MAIN")
+
+		' [임시 테스트] 1403 포트 payload 강제 생성용 무한 heartbeat
+		' 주의: 수동 Stop 전까지 MAIN이 종료되지 않음
+		While True
+			Console.WriteLine(FND.timeString() & " [RC1403] heartbeat")
+			Thread.Sleep(1000)
+		End While
+	End Sub
+
+	' ============================================================
+	' 유틸: PASS/FAIL 카운터 갱신 + 로그
+	' ok = 0 이면 FAIL, 0이 아니면 PASS (Integer 또는 Boolean 모두 허용)
+	' ============================================================
+	Private Sub Check(label As String, ok As Integer, ByRef pass As Integer, ByRef fail As Integer)
+		If ok <> 0 Then
+			pass = pass + 1
+			cehLog("[PASS] " & label, "Check")
+		Else
+			fail = fail + 1
+			cehLog("[FAIL] " & label, "Check")
+		End If
+	End Sub
+
+	' ============================================================
+	' 1. Foundation_Utils (FND)
+	' ============================================================
+	Private Sub TestFND(ByRef pass As Integer, ByRef fail As Integer)
+		Dim ctx As String
+		ctx = "TestFND"
+		cehLog("--- [FND] Foundation_Utils ---", ctx)
+
+		' 문자 상수 길이 확인
+		Check("FND.CRLF len=2",  CInt(Len(FND.CRLF) = 2), pass, fail)
+		Check("FND.CR   len=1",  CInt(Len(FND.CR)   = 1), pass, fail)
+		Check("FND.LF   len=1",  CInt(Len(FND.LF)   = 1), pass, fail)
+		Check("FND.TAB  len=1",  CInt(Len(FND.TAB)  = 1), pass, fail)
+
+		' timeString – 비어 있지 않음
+		Dim ts As String
+		ts = FND.timeString()
+		Check("FND.timeString not empty", CInt(ts <> ""), pass, fail)
+
+		' binToByte
+		Check("FND.binToByte 0b1010=10",     CInt(FND.binToByte("0b1010")    = 10),  pass, fail)
+		Check("FND.binToByte 11111111=255",   CInt(FND.binToByte("11111111")  = 255), pass, fail)
+
+		' byteToBin
+		Dim bs As String
+		bs = FND.byteToBin(10)
+		Check("FND.byteToBin 10 contains 1010", CInt(PRS.Contains(bs, "1010") = 1), pass, fail)
+		Check("FND.byteToBin 10 not empty",      CInt(bs <> ""),                    pass, fail)
+
+		' boolToByte
+		Check("FND.boolToByte True=1",  CInt(FND.boolToByte(True)  = 1), pass, fail)
+		Check("FND.boolToByte False=0", CInt(FND.boolToByte(False) = 0), pass, fail)
+	End Sub
+
+	' ============================================================
+	' 2. Concurrency_SpinLock (SNC)
+	' ============================================================
+	Private Sub TestSNC(ByRef pass As Integer, ByRef fail As Integer)
+		Dim ctx As String
+		ctx = "TestSNC"
+		cehLog("--- [SNC] Concurrency_SpinLock ---", ctx)
+
+		Dim lk As New SpinLock()
+
+		' Acquire / Release – 예외 없이 완료되면 PASS
+		Dim acquireOk As Integer
+		acquireOk = 0
+		Dim ex As New Exception
+		Try
+			lk.Acquire()
+			lk.Release()
+			acquireOk = 1
+		Catch ex
+			cehLogEx(ex, ctx)
+		End Try
+		Check("SNC.Acquire+Release no-throw", acquireOk, pass, fail)
+
+		' TryAcquire: 해제 상태 → 1, 잠금 상태 → 0
+		Dim t1 As Integer
+		Dim t2 As Integer
+		t1 = lk.TryAcquire()    ' 해제 상태 → 1
+		t2 = lk.TryAcquire()    ' 이미 잠금 → 0
+		lk.Release()
+		Check("SNC.TryAcquire unlocked=1", CInt(t1 = 1), pass, fail)
+		Check("SNC.TryAcquire locked=0",   CInt(t2 = 0), pass, fail)
+	End Sub
+
+	' ============================================================
+	' 3. Concurrency_RingQueue (RNQ)
+	' ============================================================
+	Private Sub TestRNQ(ByRef pass As Integer, ByRef fail As Integer)
+		Dim ctx As String
+		ctx = "TestRNQ"
+		cehLog("--- [RNQ] Concurrency_RingQueue ---", ctx)
+
+		' ── RingQueue_String ──
+		Dim q As New RingQueue_String(4)
+
+		Check("RNQ.Init PendingCount=0",  CInt(q.PendingCount()       = 0), pass, fail)
+		Check("RNQ.Init Integrity=1",     CInt(q.ValidateIntegrity()  = 1), pass, fail)
+
+		' Enqueue 3개
+		q.EnqueueDropOldest("A")
+		q.EnqueueDropOldest("B")
+		q.EnqueueDropOldest("C")
+		Check("RNQ.Enqueue3 count=3", CInt(q.PendingCount() = 3), pass, fail)
+
+		' TryDequeue
+		Dim v As String
+		v = ""
+		Dim dq As Integer
+		dq = q.TryDequeue(v)
+		Check("RNQ.TryDequeue ok=1",   CInt(dq = 1),   pass, fail)
+		Check("RNQ.TryDequeue val=A",  CInt(v = "A"),  pass, fail)
+		Check("RNQ.After dequeue count=2", CInt(q.PendingCount() = 2), pass, fail)
+
+		' 용량(4) 채우기: 현재 B,C → 추가 D,E → count=4
+		q.EnqueueDropOldest("D")
+		q.EnqueueDropOldest("E")
+		Dim teOk As Integer
+		teOk = q.TryEnqueue("X")    ' 가득 참 → 0
+		Check("RNQ.TryEnqueue full=0", CInt(teOk = 0), pass, fail)
+
+		' EnqueueDropOldest 초과 시 drop 카운터 증가
+		Dim dropBefore As Integer
+		dropBefore = q.DroppedCount()
+		q.EnqueueDropOldest("Z")    ' B를 drop
+		Check("RNQ.DropOldest DroppedCount+1", CInt(q.DroppedCount() > dropBefore), pass, fail)
+
+		' Reset
+		q.Reset()
+		Check("RNQ.Reset count=0", CInt(q.PendingCount() = 0), pass, fail)
+
+		' ── RingQueue_StringPair ──
+		Dim pq As New RingQueue_StringPair(3)
+		pq.EnqueueDropOldest("k1", "v1")
+		pq.EnqueueDropOldest("k2", "v2")
+		Check("RNQ.Pair count=2", CInt(pq.PendingCount() = 2), pass, fail)
+		Dim pk As String
+		Dim pv As String
+		pk = ""
+		pv = ""
+		Dim pdq As Integer
+		pdq = pq.TryDequeue(pk, pv)
+		Check("RNQ.Pair Dequeue ok=1",  CInt(pdq = 1),    pass, fail)
+		Check("RNQ.Pair key=k1",        CInt(pk = "k1"),  pass, fail)
+		Check("RNQ.Pair val=v1",        CInt(pv = "v1"),  pass, fail)
+	End Sub
+
+	' ============================================================
+	' 4. Parsing_StringUtils (PRS)
+	' ============================================================
+	Private Sub TestPRS(ByRef pass As Integer, ByRef fail As Integer)
+		Dim ctx As String
+		ctx = "TestPRS"
+		cehLog("--- [PRS] Parsing_StringUtils ---", ctx)
+
+		Dim lft As String
+		Dim rgt As String
+		lft = ""
+		rgt = ""
+
+		' SplitOnce
+		Dim so As Integer
+		so = PRS.SplitOnce("key=value", "=", lft, rgt)
+		Check("PRS.SplitOnce ok=1",     CInt(so  = 1),       pass, fail)
+		Check("PRS.SplitOnce left=key", CInt(lft = "key"),   pass, fail)
+		Check("PRS.SplitOnce right",    CInt(rgt = "value"), pass, fail)
+		Dim so2 As Integer
+		so2 = PRS.SplitOnce("nodelimsep", "=", lft, rgt)
+		Check("PRS.SplitOnce no-sep=0", CInt(so2 = 0), pass, fail)
+
+		' SafeTrim
+		Check("PRS.SafeTrim spaces",  CInt(PRS.SafeTrim("  hi  ") = "hi"), pass, fail)
+		Check("PRS.SafeTrim empty",   CInt(PRS.SafeTrim("")       = ""),   pass, fail)
+
+		' StartsWith / EndsWith
+		Check("PRS.StartsWith yes",   CInt(PRS.StartsWith("hello", "hel") = 1), pass, fail)
+		Check("PRS.StartsWith no",    CInt(PRS.StartsWith("hello", "xyz") = 0), pass, fail)
+		Check("PRS.EndsWith yes",     CInt(PRS.EndsWith("hello",   "llo") = 1), pass, fail)
+		Check("PRS.EndsWith no",      CInt(PRS.EndsWith("hello",   "xyz") = 0), pass, fail)
+
+		' Contains
+		Check("PRS.Contains yes",  CInt(PRS.Contains("hello world", "world") = 1), pass, fail)
+		Check("PRS.Contains no",   CInt(PRS.Contains("hello world", "xyz")   = 0), pass, fail)
+
+		' LastIndexOfChar
+		Check("PRS.LastIndexOfChar /=4",   CInt(PRS.LastIndexOfChar("/a/b/c", "/") = 4),  pass, fail)
+		Check("PRS.LastIndexOfChar none",  CInt(PRS.LastIndexOfChar("abc",   "/")  = -1), pass, fail)
+
+		' CountChar
+		Check("PRS.CountChar banana-a=3", CInt(PRS.CountChar("banana", "a") = 3), pass, fail)
+		Check("PRS.CountChar none=0",     CInt(PRS.CountChar("hello",  "z") = 0), pass, fail)
+
+		' ReplaceFirst / ReplaceAll
+		Check("PRS.ReplaceFirst",  CInt(PRS.ReplaceFirst("aabbaa", "a", "X") = "Xabbaa"), pass, fail)
+		Check("PRS.ReplaceAll",    CInt(PRS.ReplaceAll("aabbaa",   "a", "X") = "XXbbXX"), pass, fail)
+
+		' SafeSubstring
+		Check("PRS.SafeSubstring normal",   CInt(PRS.SafeSubstring("hello", 1, 3) = "ell"), pass, fail)
+		Check("PRS.SafeSubstring overflow", CInt(PRS.SafeSubstring("hi",    0, 100) = "hi"), pass, fail)
+
+		' ParseConfigLine
+		Dim pkey As String
+		Dim pval As String
+		pkey = ""
+		pval = ""
+		Dim pcl As Integer
+		pcl = PRS.ParseConfigLine("name = BrookBot", pkey, pval)
+		Check("PRS.ParseConfigLine ok=1",  CInt(pcl  = 1),          pass, fail)
+		Check("PRS.ParseConfigLine key",   CInt(pkey = "name"),     pass, fail)
+		Check("PRS.ParseConfigLine val",   CInt(pval = "BrookBot"), pass, fail)
+		Dim pcl2 As Integer
+		pcl2 = PRS.ParseConfigLine("# comment", pkey, pval)
+		Check("PRS.ParseConfigLine comment=2", CInt(pcl2 = 2), pass, fail)
+
+		' Parse1DArray
+		Dim dArr() As Double
+		ReDim dArr(0)
+		Dim cnt1d As Integer
+		cnt1d = PRS.Parse1DArray("1.0, 2.5, -3.0", dArr)
+		Check("PRS.Parse1DArray count=3",    CInt(cnt1d = 3),     pass, fail)
+		Check("PRS.Parse1DArray val[1]=2.5", CInt(dArr(1) = 2.5), pass, fail)
+
+		' IndexOfAny
+		Check("PRS.IndexOfAny found",  CInt(PRS.IndexOfAny("hello,world;end", ",;") = 5),  pass, fail)
+		Check("PRS.IndexOfAny none",   CInt(PRS.IndexOfAny("hello",          ",;") = -1), pass, fail)
+	End Sub
+
+	' ============================================================
+	' 5. Persistence_FileStore (PST)
+	' ============================================================
+	Private Sub TestPST(ByRef pass As Integer, ByRef fail As Integer)
+		Dim ctx As String
+		ctx = "TestPST"
+		cehLog("--- [PST] Persistence_FileStore ---", ctx)
+
+		' 경로 상수 비어 있지 않음
+		Check("PST.FLASH_PREFIX  not empty",  CInt(PST.FLASH_PREFIX  <> ""), pass, fail)
+		Check("PST.ROMDISK_PREFIX not empty", CInt(PST.ROMDISK_PREFIX <> ""), pass, fail)
+		Check("PST.TEMP_PREFIX   not empty",  CInt(PST.TEMP_PREFIX   <> ""), pass, fail)
+
+		' SafeSaveFile + FileExists
+		Dim testPath As String
+		testPath = PST.TEMP_PREFIX & "pst_test.txt"
+		Dim saveRet As Integer
+		saveRet = PST.SafeSaveFile(testPath, "hello pst test")
+		Check("PST.SafeSaveFile ok",          CInt(saveRet = PST.SAVE_SUCCESS), pass, fail)
+		Check("PST.FileExists after save=1",  CInt(PST.FileExists(testPath) = 1), pass, fail)
+
+		' ReadFileContent 왕복
+		Dim content As String
+		content = PST.ReadFileContent(testPath)
+		Check("PST.ReadFileContent correct",  CInt(content = "hello pst test"), pass, fail)
+
+		' 동일 내용 재저장 – 성공 반환 유지
+		Dim save2 As Integer
+		save2 = PST.SafeSaveFile(testPath, "hello pst test")
+		Check("PST.SafeSaveFile same-content ok", CInt(save2 = PST.SAVE_SUCCESS), pass, fail)
+
+		' 없는 파일 FileExists → 0
+		Check("PST.FileExists missing=0", CInt(PST.FileExists(PST.TEMP_PREFIX & "nonexistent_xyz_99.txt") = 0), pass, fail)
+	End Sub
+
+	' ============================================================
+	' 6. Pipeline_AsyncSave (PIP)
+	' ============================================================
+	Private Sub TestPIP(ByRef pass As Integer, ByRef fail As Integer)
+		Dim ctx As String
+		ctx = "TestPIP"
+		cehLog("--- [PIP] Pipeline_AsyncSave ---", ctx)
+
+		' 큐 무결성 초기 확인
+		Check("PIP.ValidateQueueIntegrity=1", CInt(PIP.ValidateQueueIntegrity() = 1), pass, fail)
+
+		' Enqueue + Flush + 파일 생성 확인
+		Dim pipPath As String
+		pipPath = PST.TEMP_PREFIX & "pip_test.txt"
+		PIP.Enqueue(pipPath, "pip async test content")
+		Dim flushOk As Integer
+		flushOk = PIP.Flush(3000)
+		Check("PIP.Flush ok=1", CInt(flushOk = 1), pass, fail)
+		Check("PIP.Enqueue file created", CInt(PST.FileExists(pipPath) = 1), pass, fail)
+
+		' GetCompletedCount >= 1
+		Dim cc As Integer
+		cc = PIP.GetCompletedCount()
+		Check("PIP.GetCompletedCount>=1", CInt(cc >= 1), pass, fail)
+
+		' TryEnqueue
+		Dim tryOk As Integer
+		tryOk = PIP.TryEnqueue(pipPath, "try enqueue test")
+		Check("PIP.TryEnqueue ok=1", CInt(tryOk = 1), pass, fail)
+		PIP.Flush(2000)
+
+		' PendingCount after flush – 0 기대
+		Check("PIP.PendingCount after flush=0", CInt(PIP.PendingCount() = 0), pass, fail)
+
+		' DroppedCount – 정상 상황에서 0
+		Check("PIP.GetDroppedCount=0", CInt(PIP.GetDroppedCount() = 0), pass, fail)
+	End Sub
+
+	' ============================================================
+	' 7. Format_DatStore (DAT) — SetValue/GetValue/GetArrayValue 중심
+	' ============================================================
+	Private Sub TestDAT(ByRef pass As Integer, ByRef fail As Integer)
+		Dim ctx As String
+		ctx = "TestDAT"
+		cehLog("--- [DAT] Format_DatStore ---", ctx)
+
+		Dim datPath As String
+		datPath = PST.TEMP_PREFIX & "dat_unit_test.dat"
+
+		Dim ds As New DatStore(datPath)
+
+		' SetValue / GetValue 기본
+		ds.SetValue("robot", "BrookBot")
+		ds.SetValue("speed", "1200")
+		ds.SetValue("accel", "1.5")
+		Check("DAT.GetValue robot",   CInt(ds.GetValue("robot")  = "BrookBot"), pass, fail)
+		Check("DAT.GetValue speed",   CInt(ds.GetValue("speed")  = "1200"),     pass, fail)
+		Check("DAT.GetValue accel",   CInt(ds.GetValue("accel")  = "1.5"),      pass, fail)
+		Check("DAT.GetValue missing", CInt(ds.GetValue("nokey")  = ""),         pass, fail)
+
+		' 값 덮어쓰기
+		ds.SetValue("speed", "2000")
+		Check("DAT.Overwrite speed=2000", CInt(ds.GetValue("speed") = "2000"), pass, fail)
+
+		' 배열 Set + GetArrayValue
+		ds.SetValue("tags", "[fast, safe, precise]")
+		Dim tagOut() As Double
+		ReDim tagOut(0)
+		' tags는 문자열이므로 ParseJsonArray는 비수치인 경우 0을 반환할 수 있음 – count만 확인
+		' 수치 배열로 별도 검증
+		ds.SetValue("coords", "[10.0, -5.5, 200.0]")
+		Dim coordOut() As Double
+		ReDim coordOut(2)
+		Dim coordCnt As Integer
+		coordCnt = ds.GetArrayValue("coords", coordOut)
+		Check("DAT.GetArrayValue count=3",   CInt(coordCnt = 3),         pass, fail)
+		Check("DAT.GetArrayValue [0]=10",    CInt(coordOut(0) = 10.0),   pass, fail)
+		Check("DAT.GetArrayValue [1]=-5.5",  CInt(coordOut(1) = -5.5),   pass, fail)
+		Check("DAT.GetArrayValue missing=0", CInt(ds.GetArrayValue("nokey", coordOut) = 0), pass, fail)
+
+		' SaveSync + LoadFromFile 왕복
+		Dim sr As Integer
+		sr = ds.SaveSync()
+		Check("DAT.SaveSync ok=1", CInt(sr = 1), pass, fail)
+
+		Dim ds2 As New DatStore(datPath)
+		Dim lr As Integer
+		lr = ds2.LoadFromFile()
+		Check("DAT.LoadFromFile ok=1",         CInt(lr = 1),                            pass, fail)
+		Check("DAT.Roundtrip robot",           CInt(ds2.GetValue("robot") = "BrookBot"), pass, fail)
+		Check("DAT.Roundtrip speed (overwritten)", CInt(ds2.GetValue("speed") = "2000"), pass, fail)
+
+		' GetSaveCount >= 1
+		Check("DAT.GetSaveCount>=1", CInt(ds2.GetSaveCount() >= 1), pass, fail)
+
+		' Reset – itemCount=0이므로 GetValue는 ""
+		ds.Reset()
+		Check("DAT.Reset GetValue=empty", CInt(ds.GetValue("robot") = ""), pass, fail)
+
+		' ResetMetadata
+		ds2.ResetMetadata()
+		Check("DAT.ResetMetadata saveCount=0", CInt(ds2.GetSaveCount() = 0), pass, fail)
 	End Sub
 	
-	' ─── Format_Apon 기능 테스트 ───
-	Sub TestApon()
-		Dim ctx As String
-		ctx = "TestApon"
-		cehLog("=== APON TEST START ===", ctx)
-		
-		' ── 1. AponNode 기본 값 타입 테스트 ──
-		Dim root As New AponNode()
-		
-		' SetString / GetString
-		root.SetString("name", "TestBot")
-		cehLog("[1] SetString/GetString  name=" & root.GetString("name", "?"), ctx)
-		
-		' SetInt / GetInt
-		root.SetInt("speed", 1500)
-		cehLog("[2] SetInt/GetInt  speed=" & CStr(root.GetInt("speed", 0)), ctx)
-		
-		' SetDbl / GetDbl
-		root.SetDbl("offset", 3.14159)
-		cehLog("[3] SetDbl/GetDbl  offset=" & root.GetString("offset", "?"), ctx)
-		
-		' GetString default (키 없음)
-		cehLog("[4] Default fallback  missing=" & root.GetString("nokey", "DEFAULT"), ctx)
-		
-		' ── 2. Array 테스트 ──
-		Dim arr(2) As String
-		arr(0) = "apple"
-		arr(1) = "banana"
-		arr(2) = "cherry"
-		root.SetArray("fruits", arr, 3)
-		cehLog("[5] Array count=" & CStr(root.GetArrayCount("fruits")), ctx)
-		
-		Dim arrCount As Integer
-		arrCount = root.GetArrayCount("fruits")
-		Dim fruitNode As AponNode
-		fruitNode = root.GetChild("fruits")
-		Dim arrStr As String
-		arrStr = ""
-		Dim ai As Integer
-		For ai = 0 To arrCount - 1
-			If ai > 0 Then
-				arrStr = arrStr & ", "
-			End If
-			arrStr = arrStr & fruitNode.GetArrayValue(ai)
-		Next
-		cehLog("[6] Array values=[" & arrStr & "]", ctx)
-		
-		' ── 3. Block (중첩) 테스트 ──
-		Dim blk As AponNode
-		blk = root.AddBlock("network")
-		blk.SetString("ip", "192.168.0.10")
-		blk.SetInt("port", 8080)
-		
-		cehLog("[7] Block  ip=" & root.GetChild("network").GetString("ip", "?") & _
-				"  port=" & CStr(root.GetChild("network").GetInt("port", 0)), ctx)
-		
-		' ── 4. RemoveChild 테스트 ──
-		root.RemoveChild("speed")
-		cehLog("[8] After remove speed => GetInt=" & CStr(root.GetInt("speed", -1)), ctx)
-		
-		' ── 5. HasChild 테스트 ──
-		cehLog("[9] HasChild(name)=" & CStr(root.HasChild("name")) & _
-				"  HasChild(speed)=" & CStr(root.HasChild("speed")), ctx)
-		
-		' ── 6. AponFile LoadFromString / BuildString 왕복 테스트 ──
-		Dim aponText As String
-		aponText = "# APON test config" & FND.CRLF & _
-					"robotName: BrookBot" & FND.CRLF & _
-					"version: 2" & FND.CRLF & _
-					"tags: [fast, precise, safe]" & FND.CRLF & _
-					"motor: {" & FND.CRLF & _
-					"	 maxRPM: 3000" & FND.CRLF & _
-					"	 accel: 1.5" & FND.CRLF & _
-					"}" & FND.CRLF
-		
-		Dim af As New AponFile()
-		af.LoadFromString(aponText)
-		
-		Dim r As AponNode
-		r = af.root
-		cehLog("[10] Parse  robotName=" & r.GetString("robotName", "?") & _
-				"  version=" & CStr(r.GetInt("version", 0)), ctx)
-		cehLog("[11] Parse  tags count=" & CStr(r.GetArrayCount("tags")), ctx)
-		
-		Dim motorBlock As AponNode
-		motorBlock = r.GetChild("motor")
-		If motorBlock Is Nothing Then
-			cehLog("[12] Parse  motor block NOT FOUND", ctx)
-		Else
-			cehLog("[12] Parse  motor.maxRPM=" & CStr(motorBlock.GetInt("maxRPM", 0)) & _
-					"  motor.accel=" & motorBlock.GetString("accel", "?"), ctx)
-		End If
-		
-		' BuildString 직렬화
-		Dim serialized As String
-		serialized = af.BuildString()
-		cehLog("[13] BuildString result:" & FND.CRLF & serialized, ctx)
-		
-		' 왕복 검증: 다시 파싱
-		Dim af2 As New AponFile()
-		af2.LoadFromString(serialized)
-		Dim r2 As AponNode
-		r2 = af2.root
-		Dim roundtripOk As String
-		If r2.GetString("robotName", "") = "BrookBot" And r2.GetInt("version", 0) = 2 Then
-			roundtripOk = "PASS"
-		Else
-			roundtripOk = "FAIL"
-		End If
-		cehLog("[14] Roundtrip (LoadFromString->BuildString->LoadFromString) = " & roundtripOk, ctx)
-		
-		cehLog("=== APON TEST END ===", ctx)
-	End Sub
+	' ─── AponStore 기능은 TestStoreCompare / TestAponTextAndEdges / TestAponCoverage 에서 커버 ───
+	' (TestApon legacy stub removed in VER 1.1.0)
 
 	' ─── AponStore vs DatStore 파일 저장 비교 테스트 (복합 데이터) ───
 	' TEMP_PREFIX (/ROMDISK/temp/) 에 저장하여 Flash 보호
@@ -891,6 +1175,756 @@ Module ORCH_Main ' ORCH_Main VER 1.0.0
 		cehLog("[MC2] Result = " & mdResult, ctx)
 
 		cehLog("=== MULTI-DIM PATTERN TEST END ===", ctx)
+	End Sub
+
+	' ─── APON 엣지 케이스: TEXT 블록 / 따옴표 / 소수 GetInt / 변경 감지 ───
+	' 1) TEXT 노드 변경 시그니처 반영 여부 (버그 A 회귀 테스트)
+	' 2) 특수문자/따옴표/쉼표/# 이스케이프 라운드트립
+	' 3) GetInt 소수값 방어 (버그 B 회귀 테스트)
+	Sub TestAponTextAndEdges()
+		Dim ctx As String
+		Dim passCount As Integer
+		Dim failCount As Integer
+		ctx = "AponEdges"
+		passCount = 0
+		failCount = 0
+		cehLog("=== APON EDGES TEST START ===", ctx)
+
+		' ── 1. TEXT 블록 라운드트립 ──
+		Dim aText As String
+		aText = "name: demo" & FND.CRLF & _
+				"desc(text): (" & FND.CRLF & _
+				"    |line one" & FND.CRLF & _
+				"    |line two" & FND.CRLF & _
+				")" & FND.CRLF
+
+		Dim af As New AponFile()
+		af.LoadFromString(aText)
+		Dim descNode As AponNode
+		descNode = af.root.GetChild("desc")
+		If descNode Is Nothing Then
+			cehLog("[E1] text parse: FAIL(not found)", ctx)
+			failCount = failCount + 1
+		Else
+			Dim expected As String
+			expected = "line one" & Chr(10) & "line two"
+			If descNode.value = expected Then
+				cehLog("[E1] text parse: PASS", ctx)
+				passCount = passCount + 1
+			Else
+				cehLog("[E1] text parse: FAIL  got=[" & descNode.value & "]", ctx)
+				failCount = failCount + 1
+			End If
+		End If
+
+		' 직렬화→재파싱 라운드트립
+		Dim rebuilt As String
+		rebuilt = af.BuildString()
+		Dim af2 As New AponFile()
+		af2.LoadFromString(rebuilt)
+		Dim descNode2 As AponNode
+		descNode2 = af2.root.GetChild("desc")
+		If descNode2 Is Nothing Then
+			cehLog("[E2] text roundtrip: FAIL(not found after rebuild)", ctx)
+			failCount = failCount + 1
+		ElseIf descNode2.value = descNode.value Then
+			cehLog("[E2] text roundtrip: PASS", ctx)
+			passCount = passCount + 1
+		Else
+			cehLog("[E2] text roundtrip: FAIL", ctx)
+			failCount = failCount + 1
+		End If
+
+		' ── 2. 특수문자/따옴표/이스케이프 (라운드트립) ──
+		Dim afE As New AponFile()
+		Dim r As AponNode
+		r = afE.root
+		r.SetString("withComma", "a, b, c")
+		r.SetString("withQuote", "he said ""hi""")
+		r.SetString("withHash", "price #1")
+		r.SetString("withTab", "a" & Chr(9) & "b")
+		Dim serial As String
+		serial = afE.BuildString()
+		Dim afE2 As New AponFile()
+		afE2.LoadFromString(serial)
+		Dim r2 As AponNode
+		r2 = afE2.root
+
+		If r2.GetString("withComma", "") = "a, b, c" Then
+			passCount = passCount + 1
+			cehLog("[E3] comma escape: PASS", ctx)
+		Else
+			failCount = failCount + 1
+			cehLog("[E3] comma escape: FAIL  got=[" & r2.GetString("withComma", "") & "]", ctx)
+		End If
+		If r2.GetString("withQuote", "") = "he said ""hi""" Then
+			passCount = passCount + 1
+			cehLog("[E4] quote escape: PASS", ctx)
+		Else
+			failCount = failCount + 1
+			cehLog("[E4] quote escape: FAIL  got=[" & r2.GetString("withQuote", "") & "]", ctx)
+		End If
+		If r2.GetString("withHash", "") = "price #1" Then
+			passCount = passCount + 1
+			cehLog("[E5] hash escape: PASS", ctx)
+		Else
+			failCount = failCount + 1
+			cehLog("[E5] hash escape: FAIL  got=[" & r2.GetString("withHash", "") & "]", ctx)
+		End If
+		If r2.GetString("withTab", "") = "a" & Chr(9) & "b" Then
+			passCount = passCount + 1
+			cehLog("[E6] tab escape: PASS", ctx)
+		Else
+			failCount = failCount + 1
+			cehLog("[E6] tab escape: FAIL", ctx)
+		End If
+
+		' ── 3. GetInt 소수값 방어 (버그 B 회귀) ──
+		Dim rInt As New AponNode()
+		rInt.SetString("mixNum", "42.9")
+		Dim iv As Integer
+		iv = rInt.GetInt("mixNum", -1)
+		If iv = 42 Then
+			passCount = passCount + 1
+			cehLog("[E7] GetInt on decimal: PASS  iv=" & CStr(iv), ctx)
+		Else
+			failCount = failCount + 1
+			cehLog("[E7] GetInt on decimal: FAIL  iv=" & CStr(iv), ctx)
+		End If
+
+		' ── 4. TEXT 변경 감지 (버그 A 회귀) ──
+		Dim textPath As String
+		textPath = PST.TEMP_PREFIX & "test_text_sig.apon"
+		Dim storeA As New AponStore(textPath)
+		storeA.SetDebug(1)
+		Dim descA As AponNode
+		descA = New AponNode()
+		descA.key = "note"
+		descA.SetTextData("initial line")
+		storeA.root.AddChildNode(descA)
+		Dim firstSave As Integer
+		firstSave = storeA.SaveSync()
+
+		' 동일 트리로 저장 → skip(1) 기대
+		Dim secondSave As Integer
+		secondSave = storeA.SaveSync()
+
+		' TEXT 내용만 변경 → save(1) 기대 (버그 A 수정 전엔 skip되어 FAIL)
+		descA.SetTextData("changed line A" & Chr(10) & "changed line B")
+		Dim thirdSave As Integer
+		thirdSave = storeA.SaveSync()
+
+		cehLog("[E8] TEXT sig saves  first=" & CStr(firstSave) & "  second=" & CStr(secondSave) & "  third=" & CStr(thirdSave), ctx)
+
+		' 재로드 검증
+		Dim storeB As New AponStore(textPath)
+		storeB.LoadFromFile()
+		Dim noteNode As AponNode
+		noteNode = storeB.root.GetChild("note")
+		If noteNode Is Nothing Then
+			failCount = failCount + 1
+			cehLog("[E9] TEXT persisted: FAIL(not found)", ctx)
+		ElseIf noteNode.value = "changed line A" & Chr(10) & "changed line B" Then
+			passCount = passCount + 1
+			cehLog("[E9] TEXT persisted: PASS", ctx)
+		Else
+			failCount = failCount + 1
+			cehLog("[E9] TEXT persisted: FAIL  got=[" & noteNode.value & "]", ctx)
+		End If
+
+		cehLog("[E*] Total  PASS=" & CStr(passCount) & "  FAIL=" & CStr(failCount), ctx)
+		cehLog("=== APON EDGES TEST END ===", ctx)
+	End Sub
+
+	' ─── Format_Apon 공개 API 종합 커버리지 테스트 ───
+	' AponNode / AponFile / AponStore 의 노출된 모든 주요 경로를 호출.
+	' 각 검증 항목은 [Cnn] 라벨 + PASS/FAIL 로그.
+	Sub TestAponCoverage()
+		Dim ctx As String
+		Dim pass As Integer
+		Dim fail As Integer
+		ctx = "AponCoverage"
+		pass = 0
+		fail = 0
+		cehLog("=== APON COVERAGE TEST START ===", ctx)
+
+		' ===== Section 1: AponNode 기본 setter/getter =====
+		Dim n As New AponNode("rootKey")
+		n.SetString("s1", "hello")
+		n.SetInt("i1", 1234)
+		n.SetDbl("d1", -2.5)
+		n.SetBool("b1", True)
+		n.SetBool("b2", False)
+
+		If n.GetString("s1", "?") = "hello" Then
+			pass = pass + 1
+			cehLog("[C01] SetString/GetString: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C01] SetString/GetString: FAIL", ctx)
+		End If
+		If n.GetInt("i1", 0) = 1234 Then
+			pass = pass + 1
+			cehLog("[C02] SetInt/GetInt: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C02] SetInt/GetInt: FAIL", ctx)
+		End If
+		Dim dv As Double
+		dv = n.GetDbl("d1", 0.0)
+		If dv < -2.499 And dv > -2.501 Then
+			pass = pass + 1
+			cehLog("[C03] SetDbl/GetDbl: PASS  v=" & CStr(dv), ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C03] SetDbl/GetDbl: FAIL  v=" & CStr(dv), ctx)
+		End If
+		If n.GetBool("b1", False) = True And n.GetBool("b2", True) = False Then
+			pass = pass + 1
+			cehLog("[C04] SetBool/GetBool: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C04] SetBool/GetBool: FAIL", ctx)
+		End If
+
+		' default fallback
+		If n.GetString("nokey", "DEF") = "DEF" And n.GetInt("nokey", 99) = 99 _
+				And n.GetDbl("nokey", 7.5) > 7.49 And n.GetBool("nokey", True) = True Then
+			pass = pass + 1
+			cehLog("[C05] default fallback: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C05] default fallback: FAIL", ctx)
+		End If
+
+		' GetBool 다양한 표기 (true/yes/1/on, false/no/0/off, case-insensitive)
+		n.SetString("bYes", "YES")
+		n.SetString("bNo", "Off")
+		n.SetString("bOne", "1")
+		n.SetString("bZero", "0")
+		If n.GetBool("bYes", False) = True And n.GetBool("bNo", True) = False _
+				And n.GetBool("bOne", False) = True And n.GetBool("bZero", True) = False Then
+			pass = pass + 1
+			cehLog("[C06] GetBool variants: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C06] GetBool variants: FAIL", ctx)
+		End If
+
+		' ===== Section 2: HasChild / GetChild / GetChildByIndex / RemoveChild / key prop =====
+		If n.HasChild("s1") = True And n.HasChild("xx") = False Then
+			pass = pass + 1
+			cehLog("[C07] HasChild: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C07] HasChild: FAIL", ctx)
+		End If
+
+		Dim cn As AponNode
+		cn = n.GetChild("s1")
+		If Not (cn Is Nothing) And cn.key = "s1" Then
+			pass = pass + 1
+			cehLog("[C08] GetChild + key prop: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C08] GetChild + key prop: FAIL", ctx)
+		End If
+
+		Dim cn2 As AponNode
+		cn2 = n.GetChildByIndex(0)
+		If Not (cn2 Is Nothing) Then
+			pass = pass + 1
+			cehLog("[C09] GetChildByIndex(0): PASS  key=" & cn2.key, ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C09] GetChildByIndex(0): FAIL", ctx)
+		End If
+		If n.GetChildByIndex(-1) Is Nothing And n.GetChildByIndex(9999) Is Nothing Then
+			pass = pass + 1
+			cehLog("[C10] GetChildByIndex bounds: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C10] GetChildByIndex bounds: FAIL", ctx)
+		End If
+
+		Dim removeBefore As Integer
+		removeBefore = n.childCount
+		n.RemoveChild("bZero")
+		If n.HasChild("bZero") = False And n.childCount = removeBefore - 1 Then
+			pass = pass + 1
+			cehLog("[C11] RemoveChild: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C11] RemoveChild: FAIL", ctx)
+		End If
+
+		' ===== Section 3: AddBlock 멱등성 + 다단계 중첩 =====
+		Dim blkA As AponNode
+		Dim blkA2 As AponNode
+		blkA = n.AddBlock("groupA")
+		blkA2 = n.AddBlock("groupA") ' 동일 키 → 동일 노드 반환
+		If blkA Is blkA2 Then
+			pass = pass + 1
+			cehLog("[C12] AddBlock idempotent: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C12] AddBlock idempotent: FAIL", ctx)
+		End If
+
+		Dim deep As AponNode
+		deep = blkA.AddBlock("L2").AddBlock("L3")
+		deep.SetInt("leaf", 77)
+		Dim deepRead As Integer
+		deepRead = n.GetChild("groupA").GetChild("L2").GetChild("L3").GetInt("leaf", -1)
+		If deepRead = 77 Then
+			pass = pass + 1
+			cehLog("[C13] 3-level nested block: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C13] 3-level nested block: FAIL  v=" & CStr(deepRead), ctx)
+		End If
+
+		' ===== Section 4: Array setter/getter + 가변 리사이즈 =====
+		Dim a3(2) As String
+		a3(0) = "x"
+		a3(1) = "y"
+		a3(2) = "z"
+		n.SetArray("arr3", a3, 3)
+		If n.GetArrayCount("arr3") = 3 Then
+			pass = pass + 1
+			cehLog("[C14] SetArray count=3: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C14] SetArray count=3: FAIL", ctx)
+		End If
+
+		Dim arr3Node As AponNode
+		arr3Node = n.GetChild("arr3")
+		If arr3Node.GetArrayValue(0) = "x" And arr3Node.GetArrayValue(2) = "z" _
+				And arr3Node.GetArrayValue(-1) = "" And arr3Node.GetArrayValue(99) = "" Then
+			pass = pass + 1
+			cehLog("[C15] GetArrayValue + bounds: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C15] GetArrayValue + bounds: FAIL", ctx)
+		End If
+
+		' 빈 배열
+		Dim aEmpty(0) As String
+		n.SetArray("arrEmpty", aEmpty, 0)
+		If n.GetArrayCount("arrEmpty") = 0 Then
+			pass = pass + 1
+			cehLog("[C16] SetArray count=0: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C16] SetArray count=0: FAIL", ctx)
+		End If
+
+		' 큰 배열 (가변 리사이즈)
+		Dim aBig(49) As String
+		Dim k As Integer
+		For k = 0 To 49
+			aBig(k) = "v" & CStr(k)
+		Next
+		n.SetArray("arrBig", aBig, 50)
+		Dim arrBigNode As AponNode
+		arrBigNode = n.GetChild("arrBig")
+		If n.GetArrayCount("arrBig") = 50 And arrBigNode.GetArrayValue(49) = "v49" Then
+			pass = pass + 1
+			cehLog("[C17] SetArray count=50 grow: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C17] SetArray count=50 grow: FAIL", ctx)
+		End If
+
+		' GetArrayCount on missing
+		If n.GetArrayCount("nokey") = 0 Then
+			pass = pass + 1
+			cehLog("[C18] GetArrayCount missing: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C18] GetArrayCount missing: FAIL", ctx)
+		End If
+
+		' ===== Section 5: typeHint + SetValueDataTyped + SetTextData =====
+		Dim tyNode As AponNode
+		tyNode = New AponNode("typed")
+		tyNode.SetValueDataTyped("42", "int")
+		If tyNode.value = "42" And tyNode.typeHint = "int" And tyNode.nodeType = APON_VALUE Then
+			pass = pass + 1
+			cehLog("[C19] SetValueDataTyped: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C19] SetValueDataTyped: FAIL", ctx)
+		End If
+
+		Dim txtNode As AponNode
+		txtNode = New AponNode("body")
+		txtNode.SetTextData("alpha" & Chr(10) & "beta")
+		If txtNode.nodeType = APON_TEXT And txtNode.typeHint = "text" Then
+			pass = pass + 1
+			cehLog("[C20] SetTextData: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C20] SetTextData: FAIL", ctx)
+		End If
+
+		' typeHint setter 직접
+		txtNode.typeHint = "custom"
+		If txtNode.typeHint = "custom" Then
+			pass = pass + 1
+			cehLog("[C21] typeHint setter: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C21] typeHint setter: FAIL", ctx)
+		End If
+
+		' ===== Section 6: AponFile 파서 - 인라인 주석 / 따옴표 / 타입 어노테이션 =====
+		Dim src As String
+		src = "# header comment" & FND.CRLF & _
+				"name: ""Quoted Bot""   # inline comment" & FND.CRLF & _
+				"port(int): 8080" & FND.CRLF & _
+				"ratio(double): 0.75" & FND.CRLF & _
+				"enabled(boolean): true" & FND.CRLF & _
+				"empty:" & FND.CRLF
+		Dim afP As New AponFile()
+		afP.LoadFromString(src)
+		If afP.root.GetString("name", "?") = "Quoted Bot" Then
+			pass = pass + 1
+			cehLog("[C22] quoted+inline comment: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C22] quoted+inline comment: FAIL  v=[" & afP.root.GetString("name", "?") & "]", ctx)
+		End If
+
+		Dim portNode As AponNode
+		portNode = afP.root.GetChild("port")
+		If Not (portNode Is Nothing) And portNode.typeHint = "int" And portNode.value = "8080" Then
+			pass = pass + 1
+			cehLog("[C23] type annotation parse: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C23] type annotation parse: FAIL", ctx)
+		End If
+
+		If afP.root.GetBool("enabled", False) = True Then
+			pass = pass + 1
+			cehLog("[C24] boolean parse: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C24] boolean parse: FAIL", ctx)
+		End If
+
+		Dim emptyNode As AponNode
+		emptyNode = afP.root.GetChild("empty")
+		If Not (emptyNode Is Nothing) And emptyNode.value = "" Then
+			pass = pass + 1
+			cehLog("[C25] empty value parse: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C25] empty value parse: FAIL", ctx)
+		End If
+
+		' ===== Section 7: 멀티라인 배열 + 중첩 블록 파싱 =====
+		Dim src2 As String
+		src2 = "items: [" & FND.CRLF & _
+				"    one" & FND.CRLF & _
+				"    two, three" & FND.CRLF & _
+				"    ""four, with comma""" & FND.CRLF & _
+				"]" & FND.CRLF & _
+				"motor: {" & FND.CRLF & _
+				"    rpm: 3000" & FND.CRLF & _
+				"    nested: {" & FND.CRLF & _
+				"        deep: ok" & FND.CRLF & _
+				"    }" & FND.CRLF & _
+				"}" & FND.CRLF
+		Dim afM As New AponFile()
+		afM.LoadFromString(src2)
+		If afM.root.GetArrayCount("items") = 4 Then
+			pass = pass + 1
+			cehLog("[C26] multiline array count=4: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C26] multiline array count=4: FAIL  c=" & CStr(afM.root.GetArrayCount("items")), ctx)
+		End If
+		Dim itemsNode As AponNode
+		itemsNode = afM.root.GetChild("items")
+		If itemsNode.GetArrayValue(3) = "four, with comma" Then
+			pass = pass + 1
+			cehLog("[C27] quoted array element: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C27] quoted array element: FAIL  v=[" & itemsNode.GetArrayValue(3) & "]", ctx)
+		End If
+
+		Dim deepStr As String
+		deepStr = afM.root.GetChild("motor").GetChild("nested").GetString("deep", "?")
+		If deepStr = "ok" Then
+			pass = pass + 1
+			cehLog("[C28] nested block parse: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C28] nested block parse: FAIL", ctx)
+		End If
+
+		' ===== Section 8: 비컴팩트 루트 ({...}) + 루트 배열 ([...]) =====
+		Dim afNon As New AponFile()
+		afNon.LoadFromString("{" & FND.CRLF & "  k: v" & FND.CRLF & "}")
+		If afNon.root.GetString("k", "?") = "v" Then
+			pass = pass + 1
+			cehLog("[C29] non-compact root: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C29] non-compact root: FAIL", ctx)
+		End If
+
+		Dim afRA As New AponFile()
+		afRA.LoadFromString("[a, b, c]")
+		If afRA.root.nodeType = APON_ARRAY And afRA.root.arrayCount = 3 _
+				And afRA.root.GetArrayValue(1) = "b" Then
+			pass = pass + 1
+			cehLog("[C30] root array: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C30] root array: FAIL", ctx)
+		End If
+
+		' 빈 LoadFromString
+		Dim afEmpty As New AponFile()
+		afEmpty.LoadFromString("")
+		If Not (afEmpty.root Is Nothing) And afEmpty.root.childCount = 0 Then
+			pass = pass + 1
+			cehLog("[C31] empty load: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C31] empty load: FAIL", ctx)
+		End If
+
+		' ===== Section 9: 라이터 자동 따옴표 (NeedsQuoting/EscapeQuoted) =====
+		Dim afW As New AponFile()
+		Dim wr As AponNode
+		wr = afW.root
+		wr.SetString("leadSpace", " leading")
+		wr.SetString("trailSpace", "trail ")
+		wr.SetString("withBrace", "{not a block}")
+		wr.SetString("withBracket", "[arr like]")
+		wr.SetString("withCR", "a" & Chr(13) & "b")
+		Dim wText As String
+		wText = afW.BuildString()
+		Dim afW2 As New AponFile()
+		afW2.LoadFromString(wText)
+		Dim w2 As AponNode
+		w2 = afW2.root
+		If w2.GetString("leadSpace", "") = " leading" _
+				And w2.GetString("trailSpace", "") = "trail " _
+				And w2.GetString("withBrace", "") = "{not a block}" _
+				And w2.GetString("withBracket", "") = "[arr like]" Then
+			pass = pass + 1
+			cehLog("[C32] auto-quote roundtrip: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C32] auto-quote roundtrip: FAIL", ctx)
+		End If
+
+		' ===== Section 10: BuildStringStyled - 3 styles =====
+		Dim afS As New AponFile()
+		afS.root.SetString("a", "1")
+		afS.root.SetInt("b", 2)
+		Dim arrSty(1) As String
+		arrSty(0) = "x"
+		arrSty(1) = "y"
+		afS.root.SetArray("arr", arrSty, 2)
+		Dim sBlk As AponNode
+		sBlk = afS.root.AddBlock("g")
+		sBlk.SetString("k", "v")
+
+		Dim sPretty As String
+		Dim sSingle As String
+		Dim sCompact As String
+		sPretty = afS.BuildStringStyled(APON_STYLE_PRETTY)
+		sSingle = afS.BuildStringStyled(APON_STYLE_SINGLE_LINE)
+		sCompact = afS.BuildStringStyled(APON_STYLE_COMPACT)
+
+		' 모두 라운드트립 가능해야 함
+		Dim afSP As New AponFile()
+		Dim afSS As New AponFile()
+		Dim afSC As New AponFile()
+		afSP.LoadFromString(sPretty)
+		afSS.LoadFromString(sSingle)
+		afSC.LoadFromString(sCompact)
+
+		If afSP.root.GetString("a", "") = "1" And afSP.root.GetInt("b", 0) = 2 _
+				And afSP.root.GetArrayCount("arr") = 2 _
+				And afSP.root.GetChild("g").GetString("k", "") = "v" Then
+			pass = pass + 1
+			cehLog("[C33] PRETTY roundtrip: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C33] PRETTY roundtrip: FAIL", ctx)
+		End If
+		If afSS.root.GetString("a", "") = "1" And afSS.root.GetInt("b", 0) = 2 Then
+			pass = pass + 1
+			cehLog("[C34] SINGLE_LINE roundtrip: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C34] SINGLE_LINE roundtrip: FAIL  out=[" & sSingle & "]", ctx)
+		End If
+		If afSC.root.GetString("a", "") = "1" And afSC.root.GetInt("b", 0) = 2 Then
+			pass = pass + 1
+			cehLog("[C35] COMPACT roundtrip: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C35] COMPACT roundtrip: FAIL  out=[" & sCompact & "]", ctx)
+		End If
+
+		' Compact 가 Pretty 보다 짧아야 함 (sanity)
+		If Len(sCompact) < Len(sPretty) Then
+			pass = pass + 1
+			cehLog("[C36] COMPACT shorter than PRETTY: PASS  pretty=" & CStr(Len(sPretty)) & " compact=" & CStr(Len(sCompact)), ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C36] COMPACT shorter than PRETTY: FAIL", ctx)
+		End If
+
+		' ===== Section 11: AponStore 라이프사이클 (skip-on-no-change, metadata, reload) =====
+		Dim covPath As String
+		covPath = PST.TEMP_PREFIX & "test_apon_coverage.apon"
+		Dim st As New AponStore(covPath)
+		st.SetDebug(1)
+		st.EnableMetadata(1)
+		st.ResetMetadata()
+
+		st.root.SetString("device", "PFR")
+		st.root.SetInt("rev", 1)
+		Dim r1 As Integer
+		r1 = st.SaveSync()
+		Dim sc1 As Integer
+		sc1 = st.GetSaveCount()
+
+		' 변경 없이 저장 → skip(1) 기대, SaveCount 증가 안 함
+		Dim r2 As Integer
+		r2 = st.SaveSync()
+		Dim sc2 As Integer
+		sc2 = st.GetSaveCount()
+
+		If r1 = 1 And r2 = 1 And sc1 = 1 And sc2 = 1 Then
+			pass = pass + 1
+			cehLog("[C37] SaveSync skip-on-no-change: PASS  r1=" & CStr(r1) & " r2=" & CStr(r2) & " sc1=" & CStr(sc1) & " sc2=" & CStr(sc2), ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C37] SaveSync skip-on-no-change: FAIL  r1=" & CStr(r1) & " r2=" & CStr(r2) & " sc1=" & CStr(sc1) & " sc2=" & CStr(sc2), ctx)
+		End If
+
+		' 실제 변경 → SaveCount 증가
+		st.root.SetInt("rev", 2)
+		Dim r3 As Integer
+		r3 = st.SaveSync()
+		Dim sc3 As Integer
+		sc3 = st.GetSaveCount()
+		If r3 = 1 And sc3 = 2 Then
+			pass = pass + 1
+			cehLog("[C38] SaveSync after change: PASS  sc=" & CStr(sc3), ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C38] SaveSync after change: FAIL  sc=" & CStr(sc3), ctx)
+		End If
+
+		' GetLastSaveTime 비어있지 않아야 함
+		If Len(st.GetLastSaveTime()) > 0 Then
+			pass = pass + 1
+			cehLog("[C39] GetLastSaveTime non-empty: PASS  t=" & st.GetLastSaveTime(), ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C39] GetLastSaveTime non-empty: FAIL", ctx)
+		End If
+
+		' 새 인스턴스로 LoadFromFile + 메타데이터 복구
+		Dim st2 As New AponStore(covPath)
+		st2.SetDebug(1)
+		Dim lr As Integer
+		lr = st2.LoadFromFile()
+		If lr = 1 And st2.root.GetString("device", "") = "PFR" _
+				And st2.root.GetInt("rev", 0) = 2 And st2.GetSaveCount() = 2 Then
+			pass = pass + 1
+			cehLog("[C40] LoadFromFile + metadata restore: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C40] LoadFromFile + metadata restore: FAIL  load=" & CStr(lr) & " sc=" & CStr(st2.GetSaveCount()), ctx)
+		End If
+
+		' file 프로퍼티(AponFile) 직접 접근
+		If Not (st2.file Is Nothing) And Not (st2.file.root Is Nothing) Then
+			pass = pass + 1
+			cehLog("[C41] AponStore.file accessor: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C41] AponStore.file accessor: FAIL", ctx)
+		End If
+
+		' Path setter/getter
+		st2.Path = covPath
+		If st2.Path = covPath Then
+			pass = pass + 1
+			cehLog("[C42] Path property: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C42] Path property: FAIL", ctx)
+		End If
+
+		' ResetMetadata
+		st2.ResetMetadata()
+		If st2.GetSaveCount() = 0 And st2.GetLastSaveTime() = "" Then
+			pass = pass + 1
+			cehLog("[C43] ResetMetadata: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C43] ResetMetadata: FAIL", ctx)
+		End If
+
+		' EnableMetadata(0) → 메타데이터 미기록 모드 동작 검증
+		Dim st3Path As String
+		st3Path = PST.TEMP_PREFIX & "test_apon_nometa.apon"
+		Dim st3 As New AponStore(st3Path)
+		st3.SetDebug(1)
+		st3.EnableMetadata(0)
+		st3.root.SetString("k", "v")
+		Dim r4 As Integer
+		r4 = st3.SaveSync()
+		If r4 = 1 And st3.GetSaveCount() = 0 Then
+			pass = pass + 1
+			cehLog("[C44] EnableMetadata(0): PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C44] EnableMetadata(0): FAIL  sc=" & CStr(st3.GetSaveCount()), ctx)
+		End If
+
+		' SaveAsync 경로 (Path 미설정 가드)
+		Dim stEmpty As New AponStore()
+		stEmpty.SetDebug(0)
+		stEmpty.SaveAsync() ' Path 없음 → 에러 로그만, 예외 없이 반환되어야 함
+		Dim retEmpty As Integer
+		retEmpty = stEmpty.SaveSync()
+		If retEmpty = -1 Then
+			pass = pass + 1
+			cehLog("[C45] SaveSync without Path returns -1: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C45] SaveSync without Path returns -1: FAIL  ret=" & CStr(retEmpty), ctx)
+		End If
+
+		' LoadFromFile without Path
+		Dim retLoad As Integer
+		retLoad = stEmpty.LoadFromFile()
+		If retLoad = 0 Then
+			pass = pass + 1
+			cehLog("[C46] LoadFromFile without Path returns 0: PASS", ctx)
+		Else
+			fail = fail + 1
+			cehLog("[C46] LoadFromFile without Path returns 0: FAIL  ret=" & CStr(retLoad), ctx)
+		End If
+
+		cehLog("[C*] Total  PASS=" & CStr(pass) & "  FAIL=" & CStr(fail), ctx)
+		cehLog("=== APON COVERAGE TEST END ===", ctx)
 	End Sub
 
 End Module
