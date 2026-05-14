@@ -5,7 +5,7 @@
 ' - (none)
 'Used by:
 ' - CEH, Net_Tcp_*, Storage_*, Data_*, ORCH_Main
-Module FND ' Foundation_Utils VER 1.0.0
+Module FND ' Foundation_Utils VER 1.0.2
 	' 기본적인 함수나 변수들을 모아 놓은 모듈이다.
 	'
 	'=========================

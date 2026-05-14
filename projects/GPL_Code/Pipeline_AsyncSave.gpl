@@ -6,7 +6,7 @@
 ' - Observability_ErrorHandler (로그/예외 기록)
 'Used by:
 ' - DAT(Format_DatStore), ORCH_Main
-Module PIP ' Pipeline_AsyncSave VER 1.0.0
+Module PIP ' Pipeline_AsyncSave VER 1.0.1
 
 	' 고정 크기 circular queue (ring buffer)
 	Private Const QUEUE_MAX As Integer = 64
@@ -198,21 +198,30 @@ Module PIP ' Pipeline_AsyncSave VER 1.0.0
 	End Function
 
 	'=========================
-	'	Dispatcher: 큐 감시 → pending 수만큼 워커 스레드 동적 생성
+	'	Dispatcher: 큐 감시 → 필요한 수만큼만 워커 스레드 동적 생성
+	'	인플라이트(inFlight) 기반 과잉 생성 방지:
+	'	  newWorkers = pending - inFlight (≥0 보장)
+	'	  → 이미 처리 중인 워커가 충분하면 추가 생성 안 함
 	'=========================
 	Public Sub DispatcherFunc()
 		Dim pending As Integer
+		Dim flying As Integer
+		Dim newWorkers As Integer
 		Dim i As Integer
 		Dim t As Thread
 		While True
 			lastWorkerActiveTick = Controller.Timer(1) * 1000
 			pending = PendingCount()
 			If pending > 0 Then
-				For i = 1 To pending
-					IncrementInFlight()
-					t = New Thread("PIP.OneOffWorker", , "Save" & CStr(NextThreadId()))
-					t.Start
-				Next
+				flying = GetInFlight()
+				newWorkers = pending - flying
+				If newWorkers > 0 Then
+					For i = 1 To newWorkers
+						IncrementInFlight()
+						t = New Thread("PIP.OneOffWorker", , "Save" & CStr(NextThreadId()))
+						t.Start
+					Next
+				End If
 			End If
 			Thread.Sleep(20)
 		End While
@@ -253,12 +262,7 @@ Module PIP ' Pipeline_AsyncSave VER 1.0.0
 	'=========================
 	' 동기 저장 (즉시 완료, 큐 사용 안함)
 	Public Function SaveSync(path As String, content As String) As Integer
-		' GPL에서는 Or가 단락평가가 아닐 수 있어 단계적으로 Nothing/Empty 체크
 		If path Is Nothing Then
-			SaveSync = PST.SAVE_ERROR_PATH_INVALID
-			Exit Function
-		End If
-		If content Is Nothing Then
 			SaveSync = PST.SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
@@ -266,10 +270,7 @@ Module PIP ' Pipeline_AsyncSave VER 1.0.0
 			SaveSync = PST.SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
-		If content = "" Then
-			SaveSync = PST.SAVE_ERROR_PATH_INVALID
-			Exit Function
-		End If
+		If content Is Nothing Then content = ""
 		SaveSync = PST.SafeSaveFile(path, content, 1)
 	End Function
 

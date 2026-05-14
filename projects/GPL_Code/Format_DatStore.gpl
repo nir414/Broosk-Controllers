@@ -1,4 +1,4 @@
-' DatStore: DAT 파일 포맷 저장소 (key=value + JSON 배열 지원)
+﻿' DatStore: DAT 파일 포맷 저장소 (key=value + JSON 배열 지원)
 ' 
 ' 설계:
 ' - XmlStore와 동일한 인스턴스 기반 구조
@@ -14,7 +14,7 @@
 'Used by:
 ' - ORCH_Main (예제/실사용), 기타 상위 비즈니스 로직
 
-Module DAT ' Format_DatStore VER 1.0.1
+Module DAT ' Format_DatStore VER 1.0.2
 
 	Public Class DatStore
 		Private Const MAX_ITEMS As Integer = 256
@@ -25,10 +25,10 @@ Module DAT ' Format_DatStore VER 1.0.1
 		Private m_lastDat As String
 		
 		' 원본 파일 구조 보존 (빈 줄, 주석, 데이터 순서 유지)
-		Private Const MAX_LINES As Integer = 500
-		Private lineTypes(MAX_LINES-1) As Integer    ' 0=빈줄, 1=메타데이터, 2=주석, 3=데이터
-		Private lineContents(MAX_LINES-1) As String  ' 원본 라인 내용
-		Private lineKeys(MAX_LINES-1) As String      ' 데이터 라인의 키
+		Private lineTypes() As Integer    ' 0=빈줄, 1=메타데이터, 2=주석, 3=데이터
+		Private lineContents() As String  ' 원본 라인 내용
+		Private lineKeys() As String      ' 데이터 라인의 키
+		Private lineCapacity As Integer   ' 현재 배열 크기 (동적 확장)
 		Private lineCount As Integer
 		
 		' 메타데이터: 저장 이력 추적
@@ -42,10 +42,18 @@ Module DAT ' Format_DatStore VER 1.0.1
 		' 기본값: 메타데이터 활성화
 		Public Sub New()
 			m_lastDataSig = ""
+			lineCapacity = 500
+			ReDim lineTypes(lineCapacity - 1)
+			ReDim lineContents(lineCapacity - 1)
+			ReDim lineKeys(lineCapacity - 1)
 		End Sub
 		Public Sub New(Path As String)
 			m_path = Path
 			m_lastDataSig = ""
+			lineCapacity = 500
+			ReDim lineTypes(lineCapacity - 1)
+			ReDim lineContents(lineCapacity - 1)
+			ReDim lineKeys(lineCapacity - 1)
 		End Sub
 
 		' Path 프로퍼티
@@ -168,6 +176,15 @@ Module DAT ' Format_DatStore VER 1.0.1
 			GetLastSaveTime = m_lastSaveTime
 		End Function
 		
+		' 라인 배열 용량 확보 (lineCount >= lineCapacity 시 +100 자동 확장)
+		Private Sub EnsureLineCapacity()
+			If lineCount < lineCapacity Then Exit Sub
+			lineCapacity = lineCapacity + 100
+			ReDim Preserve lineTypes(lineCapacity - 1)
+			ReDim Preserve lineContents(lineCapacity - 1)
+			ReDim Preserve lineKeys(lineCapacity - 1)
+		End Sub
+
 		Private Sub DebugLog(msg As String)
 			If m_debug <> 0 Then
 				OBS.cehLog(msg, "DatStore")
@@ -411,28 +428,25 @@ Module DAT ' Format_DatStore VER 1.0.1
 					
 					' 빈 줄 기록
 					If Len(trimmedLine) = 0 Then
-						If lineCount < MAX_LINES Then
-							lineTypes(lineCount) = 0
-							lineContents(lineCount) = ""
-							lineCount += 1
-						End If
+						EnsureLineCapacity()
+						lineTypes(lineCount) = 0
+						lineContents(lineCount) = ""
+						lineCount += 1
 					Else
 						firstChar = Mid(trimmedLine, 1, 1)
 						If firstChar = ";" Or firstChar = "#" Then
 							' 메타데이터 주석은 타입 1로 기록 (재출력 안 함)
 							If PRS.StartsWith(trimmedLine, ";_") = 1 Or PRS.StartsWith(trimmedLine, "; ===") = 1 Then
-								If lineCount < MAX_LINES Then
-									lineTypes(lineCount) = 1
-									lineContents(lineCount) = trimmedLine
-									lineCount += 1
-								End If
+								EnsureLineCapacity()
+								lineTypes(lineCount) = 1
+								lineContents(lineCount) = trimmedLine
+								lineCount += 1
 							Else
 								' 일반 주석은 타입 2로 기록 (보존)
-								If lineCount < MAX_LINES Then
-									lineTypes(lineCount) = 2
-									lineContents(lineCount) = trimmedLine
-									lineCount += 1
-								End If
+								EnsureLineCapacity()
+								lineTypes(lineCount) = 2
+								lineContents(lineCount) = trimmedLine
+								lineCount += 1
 							End If
 						Else
 							' 데이터 라인 파싱
@@ -447,12 +461,11 @@ Module DAT ' Format_DatStore VER 1.0.1
 									' keys/values 배열에 저장
 									SetValue(key, value)
 									' 라인 구조 기록 (타입 3 = 데이터)
-									If lineCount < MAX_LINES Then
-										lineTypes(lineCount) = 3
-										lineContents(lineCount) = trimmedLine
-										lineKeys(lineCount) = key
-										lineCount += 1
-									End If
+									EnsureLineCapacity()
+									lineTypes(lineCount) = 3
+									lineContents(lineCount) = trimmedLine
+									lineKeys(lineCount) = key
+									lineCount += 1
 								End If
 							End If
 						End If
