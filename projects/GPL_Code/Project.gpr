@@ -4,15 +4,15 @@ ProjectName="GPL_Code"
 ProjectStart="ORCH_Main.MAIN"
 
 ' Core (동기화/자료구조/유틸/로깅)
-ProjectSource="Concurrency_SpinLock.gpl"
-ProjectSource="Concurrency_RingQueue.gpl"
-ProjectSource="Observability_ErrorHandler.gpl"
-ProjectSource="Foundation_Utils.gpl"
-ProjectSource="Parsing_StringUtils.gpl"
+ProjectSource="Concurrency_SpinLock.gpl" ' 
+ProjectSource="Concurrency_RingQueue.gpl" ' 
+ProjectSource="Observability_ErrorHandler.gpl" ' 
+ProjectSource="Foundation_Utils.gpl" ' VER 1.0.2
+ProjectSource="Parsing_StringUtils.gpl" ' 
 
 ' Data (파일I/O/직렬화/저장소)
 ProjectSource="Persistence_FileStore.gpl"
-ProjectSource="Format_Apon.gpl"
+ProjectSource="Format_Apon.gpl" ' VER 1.2.7
 ProjectSource="Pipeline_AsyncSave.gpl"
 ProjectSource="Format_DatStore.gpl"
 
@@ -21,6 +21,6 @@ ProjectSource="Networking_TcpCommandQueue.gpl"
 ProjectSource="Networking_TcpServer.gpl"
 
 ' Main (최상위, 마지막)
-ProjectSource="Orchestration_Main.gpl"
+ProjectSource="Orchestration_Main.gpl" ' VER 1.1.0
 ProjectEnd
 

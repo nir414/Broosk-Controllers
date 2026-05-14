@@ -27,7 +27,7 @@
 ' - Foundation_Utils (FND: CRLF, timeString)
 ' - Observability_ErrorHandler (OBS: cehLog, cehLogEx, cehThrow)
 ' - Pipeline_AsyncSave (PIP: Enqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup) [AponStore only]
-Module APN ' Format_Apon VER 1.2.0
+Module APN ' Format_Apon VER 1.2.7
 	
 	Public Const APON_VALUE As Integer = 0
 	Public Const APON_BLOCK As Integer = 1
@@ -187,16 +187,23 @@ Module APN ' Format_Apon VER 1.2.0
 		End Function
 		
 		' Get integer value of child by key
+		' 소수점 포함 문자열("3.14")도 CDbl 경유로 안전 변환 (CInt 직접 호출 시 예외 위험)
+		' 시맨틱: 소수부는 0 방향 절단(truncation). GPL CInt는 round-half-away-from-zero이므로 Fix를 거쳐 정수부만 추출.
 		Public Function GetInt(childKey As String, defaultValue As Integer) As Integer
 			Dim child As AponNode
+			Dim v As String
 			child = GetChild(childKey)
 			If child Is Nothing Then
 				Return defaultValue
 			End If
-			If child.value.Length = 0 Then
+			v = child.value
+			If v.Length = 0 Then
 				Return defaultValue
 			End If
-			Return CInt(child.value)
+			If InStr(1, v, ".") > 0 Then
+				Return CInt(Fix(CDbl(v)))
+			End If
+			Return CInt(v)
 		End Function
 		
 		' Get double value of child by key
@@ -224,7 +231,8 @@ Module APN ' Format_Apon VER 1.2.0
 			If v.Length = 0 Then
 				Return defaultValue
 			End If
-			v = v.ToLower().Trim()
+			v = v.ToLower
+			v = v.Trim()
 			If v = "true" Or v = "yes" Or v = "1" Or v = "on" Then
 				Return True
 			End If
@@ -287,6 +295,9 @@ Module APN ' Format_Apon VER 1.2.0
 		End Sub
 		
 		' Set double value (3 decimal places)
+		' 주의: GPL CInt는 round-half-away-from-zero이므로 "+0.5 후 CInt" 트릭은
+		'       모든 .5 케이스를 위로 올려 +0.001 드리프트(예: 2.5 -> 2.501)를 일으킨다.
+		'       대신 Fix(0 방향 절단) 사용 → +0.5 가산이 정확한 round-to-nearest(half-up)로 동작.
 		Public Sub SetDbl(childKey As String, newValue As Double)
 			Dim sign As String
 			Dim absVal As Double
@@ -301,7 +312,7 @@ Module APN ' Format_Apon VER 1.2.0
 				sign = ""
 				absVal = newValue
 			End If
-			millis = CInt(absVal * 1000 + 0.5)
+			millis = CInt(Fix(absVal * 1000 + 0.5))
 			intPart = CInt((millis - (millis Mod 1000)) / 1000)
 			fracPart = millis Mod 1000
 			fracStr = CStr(fracPart)
@@ -573,18 +584,22 @@ Module APN ' Format_Apon VER 1.2.0
 					Exit While
 				End If
 				c = m_src.Substring(m_pos, 1)
-				If Len(endChar) > 0 And c = endChar Then
+				If c = "," Then
+					' compact/single-line style 엔트리 구분자
+					m_pos = m_pos + 1
+				ElseIf Len(endChar) > 0 And c = endChar Then
 					m_pos = m_pos + 1
 					Exit While
+				Else
+					' 한 엔트리: key[(type)] ':' value
+					ReadKeyAndType(theKey, theType)
+					SkipSpacesInline()
+					If m_pos < m_srcLen And m_src.Substring(m_pos, 1) = ":" Then
+						m_pos = m_pos + 1
+					End If
+					SkipSpacesInline()
+					ParseValueInto(block, theKey, theType)
 				End If
-				' 한 엔트리: key[(type)] ':' value
-				ReadKeyAndType(theKey, theType)
-				SkipSpacesInline()
-				If m_pos < m_srcLen And m_src.Substring(m_pos, 1) = ":" Then
-					m_pos = m_pos + 1
-				End If
-				SkipSpacesInline()
-				ParseValueInto(block, theKey, theType)
 			End While
 		End Sub
 		
@@ -601,7 +616,8 @@ Module APN ' Format_Apon VER 1.2.0
 				End If
 				m_pos = m_pos + 1
 			End While
-			outKey = m_src.Substring(start, m_pos - start).Trim()
+			outKey = m_src.Substring(start, m_pos - start)
+			outKey = outKey.Trim()
 			
 			If m_pos < m_srcLen And m_src.Substring(m_pos, 1) = "(" Then
 				m_pos = m_pos + 1
@@ -614,7 +630,8 @@ Module APN ' Format_Apon VER 1.2.0
 					End If
 					m_pos = m_pos + 1
 				End While
-				outType = m_src.Substring(tStart, m_pos - tStart).Trim()
+				outType = m_src.Substring(tStart, m_pos - tStart)
+				outType = outType.Trim()
 				If m_pos < m_srcLen Then
 					m_pos = m_pos + 1  ' consume ')'
 				End If
@@ -672,12 +689,28 @@ Module APN ' Format_Apon VER 1.2.0
 			If c = """" Then
 				v = ParseQuoted()
 			Else
-				v = ReadRawUntilDelim(False)
+				v = ReadRawScalarValue()
 			End If
 			Dim vn As New AponNode(theKey)
 			vn.SetValueDataTyped(v, theType)
 			parent.AddChildNode(vn)
 		End Sub
+
+		' key:value 엔트리에서 스칼라 값을 읽는다.
+		' compact/single-line 표현을 위해 ',', '}'를 엔트리 종료로 인식한다.
+		Private Function ReadRawScalarValue() As String
+			Dim start As Integer
+			Dim c As String
+			start = m_pos
+			While m_pos < m_srcLen
+				c = m_src.Substring(m_pos, 1)
+				If c = Chr(10) Or c = Chr(13) Or c = "#" Or c = "," Or c = "}" Then
+					Exit While
+				End If
+				m_pos = m_pos + 1
+			End While
+			Return RTrimSpaces(m_src.Substring(start, m_pos - start))
+		End Function
 		
 		' 따옴표 문자열 파싱. 호출 시 m_pos는 '"' 위치.
 		Private Function ParseQuoted() As String
@@ -846,7 +879,8 @@ Module APN ' Format_Apon VER 1.2.0
 					End If
 				End If
 			End While
-			Return m_src.Substring(start, m_pos - start).Trim()
+			c = m_src.Substring(start, m_pos - start)
+			Return c.Trim()
 		End Function
 		
 		' text 블록. 호출 시 m_pos는 '(' 바로 다음.
@@ -1049,7 +1083,11 @@ Module APN ' Format_Apon VER 1.2.0
 			End If
 			For i = 1 To n
 				c = Mid(v, i, 1)
-				If c = """" Or c = "\" Or c = "#" Or c = "," Or c = Chr(10) Or c = Chr(13) Then
+				' 공식 APON 스펙: 값 내부에 다음 문자가 있으면 따옴표 필수
+				' " ' , : { } [ ] # \n \r  (백슬래시는 이스케이프 트리거이므로 함께 처리)
+				If c = """" Or c = "'" Or c = "\" Or c = "#" Or c = "," Or c = ":" _
+					Or c = "{" Or c = "}" Or c = "[" Or c = "]" _
+					Or c = Chr(10) Or c = Chr(13) Then
 					Return True
 				End If
 			Next
@@ -1191,6 +1229,8 @@ Module APN ' Format_Apon VER 1.2.0
 		Public Sub New()
 			m_file = New AponFile()
 			m_path = ""
+			m_saveCount = 0
+			m_lastSaveTime = ""
 			m_enableMetadata = 1
 			m_lastDataSig = ""
 		End Sub
@@ -1198,6 +1238,8 @@ Module APN ' Format_Apon VER 1.2.0
 		Public Sub New(path As String)
 			m_file = New AponFile()
 			m_path = path
+			m_saveCount = 0
+			m_lastSaveTime = ""
 			m_enableMetadata = 1
 			m_lastDataSig = ""
 		End Sub
@@ -1256,6 +1298,9 @@ Module APN ' Format_Apon VER 1.2.0
 		End Function
 		
 		Public Function GetLastSaveTime() As String
+			If m_lastSaveTime Is Nothing Then
+				Return ""
+			End If
 			Return m_lastSaveTime
 		End Function
 		
@@ -1283,6 +1328,9 @@ Module APN ' Format_Apon VER 1.2.0
 				
 				If child.nodeType = APON_VALUE Then
 					sig = sig & "V" & CStr(Len(child.value)) & ":" & child.value
+				ElseIf child.nodeType = APON_TEXT Then
+					' TEXT 노드 누락 시 멀티라인 변경이 저장 스킵되는 버그 방지
+					sig = sig & "T" & CStr(Len(child.value)) & ":" & child.value
 				ElseIf child.nodeType = APON_ARRAY Then
 					sig = sig & "A" & CStr(child.arrayCount)
 					For j = 0 To child.arrayCount - 1
