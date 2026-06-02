@@ -1,27 +1,17 @@
 {
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "name": "GPL: F5 Upload + Debug",
-      "type": "brooks-gpl",
-      "request": "attach",
-      "controllerIp": "${config:gpl.controller.ip}",
-      "projectName": "GPL_Code",
-      "deployBeforeAttach": true,
-      "stopAllBeforeAttach": true,
-      "clearProjectBreakpointsOnAttach": false,
-      "stopOnEntry": true
-    },
-    {
-      "name": "GPL: Attach to Controller (Stop On Entry)",
-      "type": "brooks-gpl",
-      "request": "attach",
-      "controllerIp": "${config:gpl.controller.ip}",
-      "projectName": "GPL_Code",
-      "deployBeforeAttach": true,
-      "stopAllBeforeAttach": true,
-      "clearProjectBreakpointsOnAttach": true,
-      "stopOnEntry": true
-    }
-  ]
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "GPL: F5 Upload + Attach",
+            "type": "brooks-gpl",
+            "request": "attach",
+            "controllerIp": "${config:gpl.controller.ip}",
+            "controllerPort": 1402,
+            "projectName": "GPL_Code",
+            "deployBeforeAttach": true,
+            "stopAllBeforeAttach": true,
+            "clearProjectBreakpointsOnAttach": false,
+            "stopOnEntry": false
+        }
+    ]
 }

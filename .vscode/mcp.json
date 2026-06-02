@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "gpl-docs": {
+      "command": "cmd",
+      "args": [
+        "/c",
+        "npx",
+        "-y",
+        "@modelcontextprotocol/server-filesystem",
+        "C:\\Users\\Doyun\\Documents\\Obsidian Vault\\GPL docs"
+      ]
+    }
+  }
+}

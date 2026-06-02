@@ -2,6 +2,9 @@
 'Updated: 2026/04/20 (APON spec full coverage: inline comments, quoted/escaped strings,
 '                    multi-line arrays, text blocks, type annotations, compact+non-compact
 '                    root, root-level arrays, auto-quoting writer, boolean accessors)
+'Updated: 2026/06/02 (GetDblArray 추가: DatStore 숫자 배열 API 파리티 — DatStore 대체 준비)
+'Known limitation: 배열-of-배열([[a,b],[c,d]])은 내부 배열을 원시 문자열로 보존만 함
+'                  (GPL Function 배열 반환 불가 제약). 단일 차원 배열은 완전 지원.
 'Purpose: APON(Aspectran Parameters Object Notation) 계층적 설정 파일 파서/기록기/저장소
 'Reference (official APON docs):
 ' - KO: https://aspectran.com/ko/docs/guides/introduce-apon/
@@ -25,9 +28,9 @@
 '
 'Requires:
 ' - Foundation_Utils (FND: CRLF, timeString)
-' - Observability_ErrorHandler (OBS: cehLog, cehLogEx, cehThrow)
-' - Pipeline_AsyncSave (PIP: Enqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup) [AponStore only]
-Module APN ' Format_Apon VER 1.2.7
+' - Observability_Logger (LOG: cehLog, cehLogEx, cehThrow)
+' - Pipeline_AsyncSave (PIP: TryEnqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup) [AponStore only]
+Module APN ' Format_Apon VER 1.2.12
 	
 	Public Const APON_VALUE As Integer = 0
 	Public Const APON_BLOCK As Integer = 1
@@ -262,6 +265,28 @@ Module APN ' Format_Apon VER 1.2.7
 			End If
 			Return ""
 		End Function
+
+		' 자식 배열을 Double() 버퍼로 변환 (DatStore.GetArrayValue 숫자 배열 API 대체)
+		' return: 채운 원소 개수 (없으면 0). 비숫자 원소는 CDbl 예외 위험이 있으므로
+		'         숫자 데이터 배열에만 사용한다.
+		Public Function GetDblArray(childKey As String, ByRef outVal() As Double) As Integer
+			Dim child As AponNode
+			Dim i As Integer
+			Dim n As Integer
+			child = GetChild(childKey)
+			If child Is Nothing Then
+				Return 0
+			End If
+			n = child.arrayCount
+			If n <= 0 Then
+				Return 0
+			End If
+			ReDim outVal(n - 1)
+			For i = 0 To n - 1
+				outVal(i) = CDbl(child.GetArrayValue(i))
+			Next
+			Return n
+		End Function
 		
 		
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -345,6 +370,12 @@ Module APN ' Format_Apon VER 1.2.7
 			Else
 				Return existing
 			End If
+		End Function
+
+		' Chain-friendly block accessor.
+		' 예: root.Block("network").SetString("host", "192.168.0.10")
+		Public Function Block(childKey As String) As AponNode
+			Return AddBlock(childKey)
 		End Function
 		
 		' Remove child by key
@@ -481,7 +512,7 @@ Module APN ' Format_Apon VER 1.2.7
 			
 			Dim reader As New StreamReader(m_filename)
 			If reader Is Nothing Then
-				OBS.cehThrow(-508, "APON file not exist: " + m_filename)
+				LOG.cehThrow(-508, "APON file not exist: " + m_filename)
 			End If
 			
 			' 파일 전체를 문자열로 수집 후 문자 기반 파서에 위임
@@ -511,13 +542,13 @@ Module APN ' Format_Apon VER 1.2.7
 		Public Sub SaveToFile()
 			Dim writer As New StreamWriter(m_filename)
 			If writer Is Nothing Then
-				OBS.cehThrow(-520, "APON file cannot open: " + m_filename)
+				LOG.cehThrow(-520, "APON file cannot open: " + m_filename)
 			End If
 			writer.Write(BuildString())
 			writer.Close()
 		End Sub
 		
-		' 문자열에서 APON 로드 (DAS/저장소 연동용, 공식 APON 스펙 서브셋 지원)
+		' 문자열에서 APON 로드 (PIP/저장소 연동용, 공식 APON 스펙 서브셋 지원)
 		Public Sub LoadFromString(content As String)
 			If content = "" Then
 				m_root = New AponNode()
@@ -1196,7 +1227,7 @@ Module APN ' Format_Apon VER 1.2.7
 	
 	' AponStore: AponFile 기반 저장소 래퍼
 	' - AponFile(순수 파서)을 내부 보유, 트리 읽기/쓰기는 root 프로퍼티로 위임
-	' - DAS 경유 비동기/동기 저장 (Flash 보호)
+	' - PIP 경유 비동기/동기 저장 (Flash 보호)
 	' - 메타데이터 추적 (_SaveCount, _LastSaveTime)
 	' - 변경 감지 (BuildDataSignature) → 불필요한 저장 방지
 	
@@ -1392,30 +1423,41 @@ Module APN ' Format_Apon VER 1.2.7
 			Return s
 		End Function
 		
-		' DAS 경유 비동기 저장
+		' PIP 경유 비동기 저장
 		Public Sub SaveAsync()
 			If m_path = "" Then
-				OBS.cehLog("ERR: AponStore.SaveAsync - Path not set", "AponStore")
+				LOG.cehLog("ERR: AponStore.SaveAsync - Path not set", "AponStore")
 				Exit Sub
 			End If
 			
 			Dim curSig As String
 			Dim content As String
+			Dim enqueueOk As Integer
+			Dim oldSaveCount As Integer
+			Dim oldLastSaveTime As String
+			oldSaveCount = m_saveCount
+			oldLastSaveTime = m_lastSaveTime
 			If PrepareSaveCommon("SaveAsync", curSig, content) = 0 Then
 				Exit Sub
 			End If
 			
-			PIP.Enqueue(m_path, content)
-			DebugLog("[DEBUG] SaveAsync enqueued | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount))
-			
-			m_lastDataSig = curSig
-			m_dataChanged = 0
+			enqueueOk = PIP.TryEnqueue(m_path, content)
+			If enqueueOk = 1 Then
+				DebugLog("[DEBUG] SaveAsync enqueued | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount))
+				m_lastDataSig = curSig
+				m_dataChanged = 0
+			Else
+				m_saveCount = oldSaveCount
+				m_lastSaveTime = oldLastSaveTime
+				m_dataChanged = 1
+				LOG.cehLog("ERR: AponStore.SaveAsync enqueue failed | Path=" & m_path & " | Pending=" & CStr(PIP.PendingCount()), "AponStore")
+			End If
 		End Sub
 		
-		' DAS 경유 동기 저장
+		' PIP 경유 동기 저장
 		Public Function SaveSync() As Integer
 			If m_path = "" Then
-				OBS.cehLog("ERR: AponStore.SaveSync - Path not set", "AponStore")
+				LOG.cehLog("ERR: AponStore.SaveSync - Path not set", "AponStore")
 				Return -1
 			End If
 			
@@ -1436,16 +1478,16 @@ Module APN ' Format_Apon VER 1.2.7
 			Return result
 		End Function
 		
-		' DAS 경유 로드 (동기)
+		' PIP 경유 로드 (동기)
 		Public Function LoadFromFile() As Integer
 			If m_path = "" Then
-				OBS.cehLog("ERR: AponStore.LoadFromFile - Path not set", "AponStore")
+				LOG.cehLog("ERR: AponStore.LoadFromFile - Path not set", "AponStore")
 				Return 0
 			End If
 			DebugLog("[DEBUG] LoadFromFile start | Path=" & m_path)
 			
 			If PIP.FileExists(m_path) = 0 Then
-				OBS.cehLog("WARN: AponStore.LoadFromFile - File not exist | Path: " & m_path, "AponStore")
+				LOG.cehLog("WARN: AponStore.LoadFromFile - File not exist | Path: " & m_path, "AponStore")
 				Return 0
 			End If
 			
@@ -1466,7 +1508,7 @@ Module APN ' Format_Apon VER 1.2.7
 				DebugLog("[DEBUG] LoadFromFile done | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount) & " | SigLen=" & CStr(Len(m_lastDataSig)))
 				Return 1
 			Catch ex
-				OBS.cehLogEx(ex, "AponStore.LoadFromFile | Path: " & m_path)
+				LOG.cehLogEx(ex, "AponStore.LoadFromFile | Path: " & m_path)
 				Return 0
 			End Try
 		End Function
@@ -1530,13 +1572,13 @@ Module APN ' Format_Apon VER 1.2.7
 		
 		Private Sub DebugLog(msg As String)
 			If m_debug <> 0 Then
-				OBS.cehLog(msg, "AponStore")
+				LOG.cehLog(msg, "AponStore")
 			End If
 		End Sub
 		
 		Private Sub DebugLogVerbose(msg As String)
 			If m_debug >= 2 Then
-				OBS.cehLog(msg, "AponStore")
+				LOG.cehLog(msg, "AponStore")
 			End If
 		End Sub
 		

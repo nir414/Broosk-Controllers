@@ -5,16 +5,16 @@
 ' - DAT 포맷: key=value (스칼라) 또는 key=[...] (JSON 배열)
 ' - 배열은 PRS.ParseJsonArray로 파싱
 ' - 메타데이터 자동 추적
-' - DAS(Pipeline_AsyncSave)와 통합 (파일 I/O는 DAS가 CFS를 통해 처리)
+' - PIP(Pipeline_AsyncSave)와 통합 (파일 I/O는 PIP가 PST를 통해 처리)
 '
 'Requires:
-' - DAS (Pipeline_AsyncSave: Enqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup)
-' - Parsing_StringUtils (CSU: ParseJsonArray/ParseConfigLine/StartsWith/SafeTrim)
-' - Observability_ErrorHandler (CEH: 로그/예외 기록)
+' - Pipeline_AsyncSave (PIP: TryEnqueue/SaveSync/ReadFile/FileExists/RestoreFromBackup)
+' - Parsing_StringUtils (PRS: ParseJsonArray/ParseConfigLine/StartsWith/SafeTrim)
+' - Observability_Logger (LOG: 로그/예외 기록)
 'Used by:
 ' - ORCH_Main (예제/실사용), 기타 상위 비즈니스 로직
 
-Module DAT ' Format_DatStore VER 1.0.2
+Module DAT ' Format_DatStore VER 1.0.5
 
 	Public Class DatStore
 		Private Const MAX_ITEMS As Integer = 256
@@ -187,13 +187,13 @@ Module DAT ' Format_DatStore VER 1.0.2
 
 		Private Sub DebugLog(msg As String)
 			If m_debug <> 0 Then
-				OBS.cehLog(msg, "DatStore")
+				LOG.cehLog(msg, "DatStore")
 			End If
 		End Sub
 		
 		Private Sub DebugLogVerbose(msg As String)
 			If m_debug >= 2 Then
-				OBS.cehLog(msg, "DatStore")
+				LOG.cehLog(msg, "DatStore")
 			End If
 		End Sub
 		
@@ -318,29 +318,40 @@ Module DAT ' Format_DatStore VER 1.0.2
 
 		Public Sub SaveAsync()
 			If m_path = "" Then
-				OBS.cehLog("ERR: SaveAsync - Path not set", "DatStore")
+				LOG.cehLog("ERR: SaveAsync - Path not set", "DatStore")
 				Exit Sub
 			End If
 			
 			Dim curSig As String
 			Dim dat As String
+			Dim enqueueOk As Integer
+			Dim oldSaveCount As Integer
+			Dim oldLastSaveTime As String
+			oldSaveCount = m_saveCount
+			oldLastSaveTime = m_lastSaveTime
 			If PrepareSaveCommon("SaveAsync", curSig, dat) = 0 Then
 				Exit Sub
 			End If
 			
-			PIP.Enqueue(m_path, dat)
-			DebugLog("[DEBUG] SaveAsync enqueued | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount) & " | SigLen=" & CStr(Len(curSig)) & " | DatLen=" & CStr(Len(dat)))
-			
-			' 저장 요청 완료: 현재 일반 데이터를 기준으로 스냅샷 갱신
-			m_lastDataSig = curSig
-			m_dataChanged = 0
+			enqueueOk = PIP.TryEnqueue(m_path, dat)
+			If enqueueOk = 1 Then
+				DebugLog("[DEBUG] SaveAsync enqueued | Path=" & m_path & " | SaveCount=" & CStr(m_saveCount) & " | SigLen=" & CStr(Len(curSig)) & " | DatLen=" & CStr(Len(dat)))
+				' 큐 적재 성공 시에만 현재 일반 데이터를 기준으로 스냅샷 갱신
+				m_lastDataSig = curSig
+				m_dataChanged = 0
+			Else
+				m_saveCount = oldSaveCount
+				m_lastSaveTime = oldLastSaveTime
+				m_dataChanged = 1
+				LOG.cehLog("ERR: SaveAsync enqueue failed | Path=" & m_path & " | Pending=" & CStr(PIP.PendingCount()), "DatStore")
+			End If
 		End Sub
 
 		Public Function SaveSync() As Integer
 			Dim dat As String
 			Dim curSig As String
 			If m_path = "" Then
-				OBS.cehLog("ERR: SaveSync - Path not set", "DatStore")
+				LOG.cehLog("ERR: SaveSync - Path not set", "DatStore")
 				SaveSync = -1
 				Exit Function
 			End If
@@ -363,14 +374,14 @@ Module DAT ' Format_DatStore VER 1.0.2
 		' DAT 파일에서 로드 (동기)
 		Public Function LoadFromFile() As Integer
 			If m_path = "" Then
-				OBS.cehLog("ERR: LoadFromFile - Path not set", "DatStore")
+				LOG.cehLog("ERR: LoadFromFile - Path not set", "DatStore")
 				LoadFromFile = 0
 				Exit Function
 			End If
 			DebugLog("[DEBUG] LoadFromFile start | Path=" & m_path)
 			
 			If PIP.FileExists(m_path) = 0 Then
-				OBS.cehLog("WARN: LoadFromFile - File does not exist | Path: " & m_path, "DatStore")
+				LOG.cehLog("WARN: LoadFromFile - File does not exist | Path: " & m_path, "DatStore")
 				LoadFromFile = 0
 				Exit Function
 			End If
@@ -453,7 +464,7 @@ Module DAT ' Format_DatStore VER 1.0.2
 							parseResult = PRS.ParseConfigLine(trimmedLine, key, value)
 							
 							If m_debug = 1 Then
-								OBS.cehLog("[PARSE] Line: " & trimmedLine & " | Result: " & CStr(parseResult) & " | Key: " & key, "DatStore")
+								LOG.cehLog("[PARSE] Line: " & trimmedLine & " | Result: " & CStr(parseResult) & " | Key: " & key, "DatStore")
 							End If
 							
 							If parseResult = 1 Then
@@ -472,7 +483,7 @@ Module DAT ' Format_DatStore VER 1.0.2
 					End If
 				Next
 			Catch ex
-				OBS.cehLogEx(ex, "DatStore.LoadFromDat | Path: " & m_path)
+				LOG.cehLogEx(ex, "DatStore.LoadFromDat | Path: " & m_path)
 			End Try
 			DebugLogVerbose("[DEBUG] LoadFromDat done | itemCount=" & CStr(itemCount) & " | lineCount=" & CStr(lineCount))
 		End Sub
@@ -555,11 +566,11 @@ Module DAT ' Format_DatStore VER 1.0.2
 			End If
 
 			Dim i As Integer
-			OBS.cehLog("[DEBUG] " & label & " | itemCount=" & CStr(itemCount), "DatStore")
+			LOG.cehLog("[DEBUG] " & label & " | itemCount=" & CStr(itemCount), "DatStore")
 			For i = 0 To itemCount - 1
-				OBS.cehLog("  [" & CStr(i) & "] " & keys(i) & " = " & values(i), "DatStore")
+				LOG.cehLog("  [" & CStr(i) & "] " & keys(i) & " = " & values(i), "DatStore")
 			Next
-			OBS.cehLog("[DEBUG] SaveCount=" & CStr(m_saveCount) & " | LastSaveTime=" & m_lastSaveTime, "DatStore")
+			LOG.cehLog("[DEBUG] SaveCount=" & CStr(m_saveCount) & " | LastSaveTime=" & m_lastSaveTime, "DatStore")
 		End Sub
 
 		' 배열에 중복된 키가 있는지 검사
@@ -591,10 +602,10 @@ Module DAT ' Format_DatStore VER 1.0.2
 			lines = m_lastDat.Split(FND.CRLF)
 			lineCount = lines.Length
 			
-			OBS.cehLog("[DEBUG] LastDat Content (" & CStr(lineCount) & " lines)", "DatStore")
+			LOG.cehLog("[DEBUG] LastDat Content (" & CStr(lineCount) & " lines)", "DatStore")
 			For i = 0 To lineCount - 1
 				If lines(i) <> "" Then
-					OBS.cehLog("  [Line " & CStr(i) & "] " & lines(i), "DatStore")
+					LOG.cehLog("  [Line " & CStr(i) & "] " & lines(i), "DatStore")
 				End If
 			Next
 		End Sub

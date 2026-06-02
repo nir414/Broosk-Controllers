@@ -3,11 +3,11 @@
 'Purpose: TCP 수신 라인(명령) 전달용 고정 크기 큐 (네트워크 스레드 -> 메인 스레드)
 '
 ' [의존성 모듈]
-' - Concurrency_RingQueue.gpl    (Module RNQ): RingQueue_String 클래스
+' - Core_RingQueue.gpl           (Module RNQ): RingQueue_String 클래스
 ' - Concurrency_SpinLock.gpl     (Module SNC): SpinLock 클래스
 ' [사용처]
-' - Networking_TcpCommunication  (Module NTC): 연결별 채널 준비/바인딩
-' - Networking_TcpServerLoop     (Module NSV): Enqueue
+' - Networking_TcpServer         (Module NET, TcpCommunication): 연결별 채널 준비/바인딩
+' - Networking_TcpServer         (Module NET, Server Loop): Enqueue
 ' - Orchestration_Main           (Module ORCH_Main): GetChannel(i) polling
 '
 ' 설계:
@@ -19,7 +19,7 @@
 ' 채널 ID:
 '  - channelId = sourceIndex (TcpCommunication 내부 인덱스)
 '  - 여러 통신이 동시 진행되어도 서로의 큐/drop 카운트 분리
-Module NCQ ' Networking_TcpCommandQueue VER 1.0.0
+Module NCQ ' TcpCmdQueue VER 1.0.2
 	' 공개 상수로 노출 (소규모 프로젝트 단순화)
 	Public Const MAX_CHANNELS As Integer = 32
 

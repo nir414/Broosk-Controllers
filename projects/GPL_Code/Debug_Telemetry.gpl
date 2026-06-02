@@ -7,7 +7,7 @@
 '
 'Requires:
 ' - Concurrency_SpinLock.gpl  (Module SNC): SpinLock 클래스
-' - Observability_ErrorHandler.gpl (Module OBS): cehLog
+' - Observability_Logger.gpl (Module LOG): cehLog
 ' - Foundation_Utils.gpl      (Module FND): timeString
 ' - Parsing_StringUtils.gpl   (Module PRS): StartsWith, SplitOnce, SafeTrim
 'Used by:
@@ -20,7 +20,7 @@
 '   DBG:CLEAR            → Watch + Span 전체 초기화
 '   DBG:VERBOSE 1        → 상세 로그 ON
 '   DBG:STATUS           → 모듈 활성화/Watch 수/Span 수 출력
-Module DBG ' Debug_Telemetry VER 1.0.0
+Module DBG ' Debug_Telemetry VER 1.0.3
 
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 	'''''''''''''''''''''''' CONSTANTS '''''''''''''''''''''''''''''
@@ -62,25 +62,14 @@ Module DBG ' Debug_Telemetry VER 1.0.0
 	' 마스터 토글을 설정한다. 0=OFF(기본), 1=ON.
 	' OFF 시 SetWatch/SpanBegin/SpanEnd 모두 즉시 반환 (오버헤드 없음).
 	Public Sub SetEnabled(ByVal enabled As Integer)
-		If enabled <> 0 Then
-			m_enabled = 1
-		Else
-			m_enabled = 0
-		End If
+		m_enabled = 0
+		If enabled <> 0 Then m_enabled = 1
 	End Sub
-
-	' 현재 활성화 상태를 반환한다.
-	Public Function GetEnabled() As Integer
-		GetEnabled = m_enabled
-	End Function
 
 	' 상세 로그 토글 (1=ON: SpanBegin/End 시 로그 출력).
 	Public Sub SetVerbose(ByVal verbose As Integer)
-		If verbose <> 0 Then
-			m_verbose = 1
-		Else
-			m_verbose = 0
-		End If
+		m_verbose = 0
+		If verbose <> 0 Then m_verbose = 1
 	End Sub
 
 
@@ -133,25 +122,20 @@ Module DBG ' Debug_Telemetry VER 1.0.0
 		m_watchLock.Release()
 	End Sub
 
-	' 현재 등록된 Watch 항목 수를 반환한다.
-	Public Function GetWatchCount() As Integer
-		GetWatchCount = m_watchCount
-	End Function
-
-	' 등록된 모든 Watch 항목을 OBS.cehLog로 출력한다.
+	' 등록된 모든 Watch 항목을 LOG.cehLog로 출력한다.
 	Public Sub EmitSnapshot(ByVal context As String)
 		Dim i As Integer
 		Dim name As String
 		Dim value As String
 		If context Is Nothing Then context = "DBG.EmitSnapshot"
-		OBS.cehLog("[DBG:SNAP] watch_count=" & CStr(m_watchCount), context)
+		LOG.cehLog("[DBG:SNAP] watch_count=" & CStr(m_watchCount), context)
 		m_watchLock.Acquire()
 		For i = 0 To m_watchCount - 1
 			name = m_watchNames(i)
 			value = m_watchValues(i)
 			If name Is Nothing Then name = ""
 			If value Is Nothing Then value = ""
-			OBS.cehLog("  watch[" & CStr(i) & "] " & name & "=" & value, context)
+			LOG.cehLog("  watch[" & CStr(i) & "] " & name & "=" & value, context)
 		Next
 		m_watchLock.Release()
 	End Sub
@@ -206,7 +190,7 @@ Module DBG ' Debug_Telemetry VER 1.0.0
 		m_spanLock.Release()
 
 		If m_verbose = 1 And slot >= 0 Then
-			OBS.cehLog("[DBG:SPAN] begin " & name, "DBG.SpanBegin")
+			LOG.cehLog("[DBG:SPAN] begin " & name, "DBG.SpanBegin")
 		End If
 	End Sub
 
@@ -238,7 +222,7 @@ Module DBG ' Debug_Telemetry VER 1.0.0
 		m_spanLock.Release()
 
 		If m_verbose = 1 And slot >= 0 Then
-			OBS.cehLog("[DBG:SPAN] end " & name & " elapsed=" & CStr(CInt(elapsed)) & "ms", "DBG.SpanEnd")
+			LOG.cehLog("[DBG:SPAN] end " & name & " elapsed=" & CStr(CInt(elapsed)) & "ms", "DBG.SpanEnd")
 		End If
 	End Sub
 
@@ -257,12 +241,7 @@ Module DBG ' Debug_Telemetry VER 1.0.0
 		m_spanLock.Release()
 	End Sub
 
-	' 현재 등록된 Span 수를 반환한다.
-	Public Function GetSpanCount() As Integer
-		GetSpanCount = m_spanSlots
-	End Function
-
-	' 등록된 모든 Span 항목을 OBS.cehLog로 출력한다.
+	' 등록된 모든 Span 항목을 LOG.cehLog로 출력한다.
 	Public Sub EmitSpans(ByVal context As String)
 		Dim i As Integer
 		Dim name As String
@@ -270,7 +249,7 @@ Module DBG ' Debug_Telemetry VER 1.0.0
 		Dim last As Double
 		Dim avg As Double
 		If context Is Nothing Then context = "DBG.EmitSpans"
-		OBS.cehLog("[DBG:SPAN] span_count=" & CStr(m_spanSlots), context)
+		LOG.cehLog("[DBG:SPAN] span_count=" & CStr(m_spanSlots), context)
 		m_spanLock.Acquire()
 		For i = 0 To m_spanSlots - 1
 			name = m_spanNames(i)
@@ -282,7 +261,7 @@ Module DBG ' Debug_Telemetry VER 1.0.0
 			Else
 				avg = 0
 			End If
-			OBS.cehLog("  span[" & CStr(i) & "] " & name & " last=" & CStr(CInt(last)) & "ms avg=" & CStr(CInt(avg)) & "ms count=" & CStr(cnt), context)
+			LOG.cehLog("  span[" & CStr(i) & "] " & name & " last=" & CStr(CInt(last)) & "ms avg=" & CStr(CInt(avg)) & "ms count=" & CStr(cnt), context)
 		Next
 		m_spanLock.Release()
 	End Sub

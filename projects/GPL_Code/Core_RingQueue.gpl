@@ -7,7 +7,7 @@
 ' - 이 모듈은 "저수준 자료구조"만 제공한다. (도메인 정책/워커/채널 로직은 각 모듈에 남긴다)
 ' - fixed-size ring buffer + overflow 정책(oldest drop) + TryEnqueue(overflow reject)
 ' - 진단: PendingCount / DroppedCount / ValidateIntegrity
-Module RNQ ' Concurrency_RingQueue VER 1.0.0
+Module RNQ ' Core_RingQueue VER 1.0.1
 
 	'=========================
 	' RingQueue_String
@@ -228,4 +228,3 @@ Module RNQ ' Concurrency_RingQueue VER 1.0.0
 	End Class
 
 End Module
-

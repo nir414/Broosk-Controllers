@@ -2,8 +2,8 @@
 'Purpose: Flash 수명을 고려한 안전한 파일 저장 관리자
 'Notes:
 ' - LEGACY ModuleName(Storage_File_Manager) 대체 구현
-' - 신규/개선 코드는 CFS 모듈명을 사용
-Module PST ' Persistence_FileStore VER 1.0.4
+' - 신규/개선 코드는 PST 모듈명을 사용
+Module PST ' Persistence_FileStore VER 1.0.15
 
 	' 저장 결과 상수
 	Public Const SAVE_SUCCESS As Integer = 1
@@ -15,8 +15,7 @@ Module PST ' Persistence_FileStore VER 1.0.4
 
 	' 파일 시스템 경로 상수
 	Public Const FLASH_PREFIX As String = "/flash/"
-	Public Const ROMDISK_PREFIX As String = "/ROMDISK/"
-	Public Const TEMP_PREFIX As String = "/ROMDISK/tmp/"  ' OBS 로그 디렉토리와 통합 (/ROMDISK/temp/ 제거)
+	Public Const TEMP_PREFIX As String = FND.ROMDISK_TMP_PREFIX  ' 공통 ROMDISK/tmp 경로
 
 	' 임시 파일 경로 생성용 내부 카운터 (타임스탬프 충돌 방지)
 	Private Dim tempSeq As Integer
@@ -27,12 +26,12 @@ Module PST ' Persistence_FileStore VER 1.0.4
 	'=========================
 	Public Function SafeSaveFile(path As String, content As String, useBackup As Integer) As Integer
 		If path Is Nothing Then
-			OBS.cehLog("ERR: Invalid path (Nothing)", "PST.SafeSaveFile")
+			LOG.cehLog("ERR: Invalid path (Nothing)", "PST.SafeSaveFile")
 			SafeSaveFile = SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
 		If path = "" Then
-			OBS.cehLog("ERR: Invalid path (empty string)", "PST.SafeSaveFile")
+			LOG.cehLog("ERR: Invalid path (empty string)", "PST.SafeSaveFile")
 			SafeSaveFile = SAVE_ERROR_PATH_INVALID
 			Exit Function
 		End If
@@ -66,11 +65,40 @@ Module PST ' Persistence_FileStore VER 1.0.4
 	Public Function FileExists(path As String) As Integer
 		Dim ex As New Exception
 		Try
-			If File.Length(path) >= 0 Then
-				FileExists = 1
-			Else
+			If path Is Nothing Then
 				FileExists = 0
+				Exit Function
 			End If
+			If path = "" Then
+				FileExists = 0
+				Exit Function
+			End If
+
+			Dim pos As Integer
+			Dim dirPath As String
+			Dim fileName As String
+			pos = FindLastSlashPos(path)
+			If pos > 0 Then
+				dirPath = Mid(path, 1, pos - 1)
+				fileName = Mid(path, pos + 1)
+			Else
+				dirPath = "."
+				fileName = path
+			End If
+			If Mid(dirPath, Len(dirPath), 1) <> "/" Then
+				dirPath = dirPath & "/"
+			End If
+
+			Dim files() As String
+			Dim i As Integer
+			files = File.GetFiles(dirPath)
+			For i = 0 To files.Length - 1
+				If files(i) = fileName Or files(i) = path Then
+					FileExists = 1
+					Exit Function
+				End If
+			Next
+			FileExists = 0
 		Catch ex
 			FileExists = 0
 		End Try
@@ -85,11 +113,19 @@ Module PST ' Persistence_FileStore VER 1.0.4
 			End If
 
 			Dim reader As StreamReader
+			Dim n As Integer
+			Dim text As String
 			reader = New StreamReader(path)
-			ReadFileContent = reader.ReadToEnd()  ' 원본 줄 끝(CRLF/LF) 그대로 보존
+			text = ""
+			n = reader.Read()
+			While n >= 0
+				text = text & Chr(n)
+				n = reader.Read()
+			End While
 			reader.Close()
+			ReadFileContent = text
 		Catch ex
-			OBS.cehLogEx(ex, "PST.ReadFileContent | Path: " & path)
+			LOG.cehLogEx(ex, "PST.ReadFileContent | Path: " & path)
 			ReadFileContent = ""
 		End Try
 	End Function
@@ -100,15 +136,15 @@ Module PST ' Persistence_FileStore VER 1.0.4
 			Dim backupPath As String
 			backupPath = path & ".bak"
 			If Not FileExists(backupPath) Then
-				OBS.cehLog("WARN: No backup found | Path: " & backupPath, "PST.RestoreFromBackup")
+				LOG.cehLog("WARN: No backup found | Path: " & backupPath, "PST.RestoreFromBackup")
 				RestoreFromBackup = 0
 				Exit Function
 			End If
 			File.Copy(backupPath, path)
-			OBS.cehLog("Restored from backup | Path: " & path, "PST.RestoreFromBackup")
+			LOG.cehLog("Restored from backup | Path: " & path, "PST.RestoreFromBackup")
 			RestoreFromBackup = 1
 		Catch ex
-			OBS.cehLogEx(ex, "PST.RestoreFromBackup | Path: " & path)
+			LOG.cehLogEx(ex, "PST.RestoreFromBackup | Path: " & path)
 			RestoreFromBackup = 0
 		End Try
 	End Function
@@ -124,10 +160,10 @@ Module PST ' Persistence_FileStore VER 1.0.4
 			backupPath = path & ".deleted"
 			File.Copy(path, backupPath)
 			File.DeleteFile(path)
-			OBS.cehLog("File deleted with backup | Path: " & path, "PST.DeleteFileWithBackup")
+			LOG.cehLog("File deleted with backup | Path: " & path, "PST.DeleteFileWithBackup")
 			DeleteFileWithBackup = 1
 		Catch ex
-			OBS.cehLogEx(ex, "PST.DeleteFileWithBackup | Path: " & path)
+			LOG.cehLogEx(ex, "PST.DeleteFileWithBackup | Path: " & path)
 			DeleteFileWithBackup = 0
 		End Try
 	End Function
@@ -139,13 +175,19 @@ Module PST ' Persistence_FileStore VER 1.0.4
 			Dim i As Integer
 			files = File.GetFiles(TEMP_PREFIX)
 			For i = 0 To files.Length - 1
-				If Mid(files(i), Len(files(i)) - 3) = ".tmp" Then
-					File.DeleteFile(TEMP_PREFIX & files(i))
-					OBS.cehLog("Cleaned temp file | File: " & files(i), "PST.CleanupTempFiles")
+				If Len(files(i)) >= 4 Then
+					If Mid(files(i), Len(files(i)) - 3) = ".tmp" Then
+						File.DeleteFile(TEMP_PREFIX & files(i))
+						LOG.cehLog("Cleaned temp file | File: " & files(i), "PST.CleanupTempFiles")
+					End If
 				End If
 			Next
 		Catch ex
-			OBS.cehLogEx(ex, "PST.CleanupTempFiles")
+			If ex.ErrorCode = -508 Then
+				' tmp 디렉터리가 아직 없는 경우(클린 부팅): 정리할 파일 없음 → 정상 처리
+			Else
+				LOG.cehLogEx(ex, "PST.CleanupTempFiles")
+			End If
 		End Try
 	End Sub
 
@@ -166,7 +208,7 @@ Module PST ' Persistence_FileStore VER 1.0.4
 		tempPath = GenerateTempPath(path)
 
 		If DirectSaveFile(tempPath, content) <> SAVE_SUCCESS Then
-			OBS.cehLog("ERR: Failed to write temp file | Path: " & tempPath, "PST.SafeSaveToFlash")
+			LOG.cehLog("ERR: Failed to write temp file | Path: " & tempPath, "PST.SafeSaveToFlash")
 			SafeSaveToFlash = SAVE_ERROR_TEMP_FAILED
 			Exit Function
 		End If
@@ -174,17 +216,18 @@ Module PST ' Persistence_FileStore VER 1.0.4
 		If useBackup = 1 And FileExists(path) Then
 			backupPath = path & ".bak"
 			If Not CreateBackup(path, backupPath) Then
-				OBS.cehLog("WARN: Backup creation failed | Path: " & backupPath, "PST.SafeSaveToFlash")
+				LOG.cehLog("WARN: Backup creation failed | Path: " & backupPath, "PST.SafeSaveToFlash")
 			End If
 		End If
 
 		If Not AtomicMove(tempPath, path) Then
-			OBS.cehLog("ERR: Failed to move temp to final | Temp: " & tempPath & " -> Final: " & path, "PST.SafeSaveToFlash")
+			LOG.cehLog("ERR: Failed to move temp to final | Temp: " & tempPath & " -> Final: " & path, "PST.SafeSaveToFlash")
+			DeleteTempFileNoThrow(tempPath)
 			SafeSaveToFlash = SAVE_ERROR_MOVE_FAILED
 			Exit Function
 		End If
 
-		OBS.cehLog("Safe save completed | Path: " & path, "PST.SafeSaveToFlash")
+		LOG.cehLog("Safe save completed | Path: " & path, "PST.SafeSaveToFlash")
 		SafeSaveToFlash = SAVE_SUCCESS
 	End Function
 
@@ -198,7 +241,7 @@ Module PST ' Persistence_FileStore VER 1.0.4
 			writer.Close()
 			DirectSaveFile = SAVE_SUCCESS
 		Catch ex
-			OBS.cehLogEx(ex, "PST.DirectSaveFile | Path: " & path)
+			LOG.cehLogEx(ex, "PST.DirectSaveFile | Path: " & path)
 			DirectSaveFile = SAVE_ERROR_WRITE_FAILED
 		End Try
 	End Function
@@ -245,6 +288,17 @@ Module PST ' Persistence_FileStore VER 1.0.4
 		End Try
 	End Function
 
+	Private Sub DeleteTempFileNoThrow(path As String)
+		Dim ex As Exception
+		If path Is Nothing Then Exit Sub
+		If path = "" Then Exit Sub
+		Try
+			File.DeleteFile(path)
+		Catch ex
+			' best-effort cleanup
+		End Try
+	End Sub
+
 	' パス文字列中の最後の "/" 位置を返す (0-based index)。見つからなければ -1。
 	Private Function FindLastSlashPos(ByVal path As String) As Integer
 		Dim i As Integer
@@ -259,6 +313,8 @@ Module PST ' Persistence_FileStore VER 1.0.4
 
 	Private Function GenerateTempPath(originalPath As String) As String
 		Dim fileName As String
+		Dim safeFileName As String
+		Dim safeTime As String
 		Dim pos As Integer
 		Dim seq As Integer
 		pos = FindLastSlashPos(originalPath)
@@ -272,33 +328,33 @@ Module PST ' Persistence_FileStore VER 1.0.4
 		tempSeq = tempSeq + 1
 		seq = tempSeq
 		tempSeqLock.Release()
-		GenerateTempPath = TEMP_PREFIX & fileName & "_" & FND.timeString() & "_" & CStr(seq) & ".tmp"
+		safeFileName = SanitizeTempNamePart(fileName)
+		safeTime = SanitizeTempNamePart(FND.timeString())
+		If safeFileName = "" Then safeFileName = "save"
+		If safeTime = "" Then safeTime = "time"
+		GenerateTempPath = TEMP_PREFIX & safeFileName & "_" & safeTime & "_" & CStr(seq) & ".tmp"
 	End Function
 
-	' 끝의 '/'를 제거한 정규화 경로 반환 (루트 '/'는 유지)
-	Private Function NormalizeDirPath(path As String) As String
-		Dim normalized As String
-		normalized = path
-		While Len(normalized) > 1 And Mid(normalized, Len(normalized), 1) = "/"
-			normalized = Mid(normalized, 1, Len(normalized) - 1)
-		End While
-		NormalizeDirPath = normalized
-	End Function
-
-	' 제어기 기본 디렉터리(항상 존재) 여부
-	Private Function IsKnownStableDirectory(dirPath As String) As Integer
-		Dim normalized As String
-		normalized = NormalizeDirPath(dirPath)
-		If normalized = "/flash" Then
-			IsKnownStableDirectory = 1
-		ElseIf normalized = "/ROMDISK" Then
-			IsKnownStableDirectory = 1
-		ElseIf normalized = "/ROMDISK/tmp" Then
-			IsKnownStableDirectory = 1
-		Else
-			IsKnownStableDirectory = 0
+	Private Function SanitizeTempNamePart(value As String) As String
+		Dim i As Integer
+		Dim ch As String
+		Dim result As String
+		If value Is Nothing Then
+			SanitizeTempNamePart = ""
+			Exit Function
 		End If
+		result = ""
+		For i = 1 To Len(value)
+			ch = Mid(value, i, 1)
+			If (ch >= "0" And ch <= "9") Or (ch >= "A" And ch <= "Z") Or (ch >= "a" And ch <= "z") Or ch = "." Or ch = "_" Or ch = "-" Then
+				result = result & ch
+			Else
+				result = result & "_"
+			End If
+		Next
+		SanitizeTempNamePart = result
 	End Function
+
 
 	Private Function EnsureDirectory(filePath As String) As Integer
 		Dim ex As New Exception
@@ -308,7 +364,7 @@ Module PST ' Persistence_FileStore VER 1.0.4
 			pos = FindLastSlashPos(filePath)
 			If pos > 0 Then
 				dirPath = Mid(filePath, 1, pos - 1)
-				If IsKnownStableDirectory(dirPath) = 0 Then
+				If Not DirectoryExists(dirPath) Then
 					File.CreateDirectory(dirPath)
 				End If
 			End If
@@ -321,6 +377,29 @@ Module PST ' Persistence_FileStore VER 1.0.4
 				Console.WriteLine(FND.timeString() & " [" & Thread.CurrentThread.Name & "] ERR(" & CStr(ex.ErrorCode) & "): PST.EnsureDirectory - " & ex.Message() & " | Path: " & filePath)
 				EnsureDirectory = 0
 			End If
+		End Try
+	End Function
+
+	Private Function DirectoryExists(dirPath As String) As Integer
+		Dim ex As New Exception
+		Try
+			If dirPath Is Nothing Then
+				DirectoryExists = 0
+				Exit Function
+			End If
+			If dirPath = "" Then
+				DirectoryExists = 0
+				Exit Function
+			End If
+			If Mid(dirPath, Len(dirPath), 1) <> "/" Then
+				dirPath = dirPath & "/"
+			End If
+
+			Dim files() As String
+			files = File.GetFiles(dirPath)
+			DirectoryExists = 1
+		Catch ex
+			DirectoryExists = 0
 		End Try
 	End Function
 

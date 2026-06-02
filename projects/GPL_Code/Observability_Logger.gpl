@@ -1,11 +1,11 @@
-' Last Update 2026/03/04 17:30
-Module OBS ' Observability_ErrorHandler VER 1.0.3
+' Last Update 2026/06/02 00:00
+Module LOG ' Observability_Logger VER 1.0.13
 	' [의존성 모듈]
 	' - Concurrency_SpinLock.gpl   (Module SNC): SpinLock 클래스 사용
 	' - Parsing_StringUtils.gpl(Module PRS): PRS.LastIndexOfChar 사용
 	' - Foundation_Utils.gpl      (Module FND) : FND.timeString 사용
 
-	Private Const logFilePath As String = "/ROMDISK/tmp/Robot.log"
+	Private Const logFilePath As String = FND.ROMDISK_TMP_PREFIX & "Robot.log"
 	Private Const logFlushEveryLines As Integer = 16
 	Private Const logFlushIntervalMs As Integer = 300
 	' 스레드 이름 prefix 포함 여부 (0=OFF, 1=ON). SetIncludeThreadName()으로 변경.
@@ -23,9 +23,9 @@ Module OBS ' Observability_ErrorHandler VER 1.0.3
 	' ========================================
 	' Delegate 기반 로그 sink (외부 모듈 확장 포인트)
 	' ========================================
-	' OBS는 sink의 구체 타입을 알 필요 없다 (의존성 역전).
+	' LOG는 sink의 구체 타입을 알 필요 없다 (의존성 역전).
 	' TCP 등 외부 모듈이 RegisterLogSink로 등록하면 EmitLogLine에서 자동 호출된다.
-	' 사용 예: OBS.RegisterLogSink(AddressOf NET.ForwardLogLine)
+	' 사용 예: LOG.RegisterLogSink(AddressOf NET.ForwardLogLine)
 	Public Delegate Sub LogSinkSub(line As String)
 	Private Const SINK_MAX As Integer = 4
 	Private Dim sinkList(SINK_MAX - 1) As LogSinkSub
@@ -72,7 +72,7 @@ Module OBS ' Observability_ErrorHandler VER 1.0.3
 							Else
 								ensureOk = 0
 								' 디렉토리 생성의 실제 실패만 콘솔에 남겨 관측 가능하게 한다.
-								Console.WriteLine(BuildPrefix("OBS.EnsureLogDirectory") & " ERR(" & CStr(ex.ErrorCode) & "): mkdir failed: " & ex.Message())
+								Console.WriteLine(BuildPrefix("LOG.EnsureLogDirectory") & " ERR(" & CStr(ex.ErrorCode) & "): mkdir failed: " & ex.Message())
 							End If
 						End Try
 						If ensureOk = 1 Then
@@ -120,7 +120,7 @@ Module OBS ' Observability_ErrorHandler VER 1.0.3
 			logLastFlushMs = Controller.Timer(1) * 1000
 		Catch ex
 			logWriterOpened = 0
-			Console.WriteLine(BuildPrefix("OBS.EnsureLogWriterOpened") & " ERR: open failed: " & ex.Message())
+			Console.WriteLine(BuildPrefix("LOG.EnsureLogWriterOpened") & " ERR: open failed: " & ex.Message())
 		End Try
 	End Sub
 
@@ -156,10 +156,11 @@ Module OBS ' Observability_ErrorHandler VER 1.0.3
 			End If
 		Catch ex
 			' 파일 기록 실패를 콘솔에 남겨 관측 가능하게 한다.
-			Console.WriteLine(BuildPrefix("OBS.WriteLogFile") & " ERR: write failed: " & ex.Message())
+			Console.WriteLine(BuildPrefix("LOG.WriteLogFile") & " ERR: write failed: " & ex.Message())
 			CloseLogWriterNoThrow()
+		Finally
+			logWriteLock.Release()
 		End Try
-		logWriteLock.Release()
 	End Sub
 
 	' (sandbox) TCP forward 제거됨
@@ -211,31 +212,29 @@ Module OBS ' Observability_ErrorHandler VER 1.0.3
 
 	' 파일 로그를 활성화(1) 또는 비활성화(0)한다. 기본값은 OFF(0).
 	Public Sub SetFileLogEnabled(enabled As Integer)
-		fileLogEnabled = enabled
+		If enabled <> 0 Then
+			fileLogEnabled = 1
+			Exit Sub
+		End If
+		If fileLogEnabled = 0 Then Exit Sub
+		fileLogEnabled = 0
+		logWriteLock.Acquire()
+		Try
+			CloseLogWriterNoThrow()
+		Finally
+			logWriteLock.Release()
+		End Try
 	End Sub
-
-	' 현재 파일 로그 활성화 상태를 반환한다.
-	Public Function GetFileLogEnabled() As Integer
-		GetFileLogEnabled = fileLogEnabled
-	End Function
 
 	' 로그 prefix에 스레드 이름을 포함할지 설정한다. 기본값은 OFF(0).
 	' 멀티스레드 환경에서 TCPCOM0, TCPCOM1 등 스레드 식별에 유용.
 	Public Sub SetIncludeThreadName(ByVal enabled As Integer)
-		If enabled <> 0 Then
-			includeThreadNameInPrefix = 1
-		Else
-			includeThreadNameInPrefix = 0
-		End If
+		includeThreadNameInPrefix = 0
+		If enabled <> 0 Then includeThreadNameInPrefix = 1
 	End Sub
 
-	' 현재 스레드 이름 포함 여부를 반환한다.
-	Public Function GetIncludeThreadName() As Integer
-		GetIncludeThreadName = includeThreadNameInPrefix
-	End Function
-
 	' 로그 sink를 등록한다. 최대 SINK_MAX개까지 등록 가능.
-	Public Sub RegisterLogSink(sink As LogSinkSub)
+	Public Sub RegisterLogSink(ByVal sink As LogSinkSub)
 		If sink Is Nothing Then Exit Sub
 		If sinkCount >= SINK_MAX Then Exit Sub
 		sinkList(sinkCount) = sink
@@ -270,15 +269,23 @@ Module OBS ' Observability_ErrorHandler VER 1.0.3
 		shouldLog = 0
 
 		throttleLock.Acquire()
-		slot = FindThrottleSlot(key)
-		throttleCounts(slot) = throttleCounts(slot) + 1
-		If nowMs - throttleLastMs(slot) >= intervalMs Then
-			throttleLastMs(slot) = nowMs
-			accumulated = throttleCounts(slot)
-			throttleCounts(slot) = 0
-			shouldLog = 1
-		End If
-		throttleLock.Release()
+		Try
+			slot = FindThrottleSlot(key)
+			throttleCounts(slot) = throttleCounts(slot) + 1
+			If throttleLastMs(slot) <= 0 Then
+				throttleLastMs(slot) = nowMs
+				accumulated = throttleCounts(slot)
+				throttleCounts(slot) = 0
+				shouldLog = 1
+			ElseIf nowMs - throttleLastMs(slot) >= intervalMs Then
+				throttleLastMs(slot) = nowMs
+				accumulated = throttleCounts(slot)
+				throttleCounts(slot) = 0
+				shouldLog = 1
+			End If
+		Finally
+			throttleLock.Release()
+		End Try
 
 		If shouldLog = 1 Then
 			cehLogEx(ex, context & " | throttled=" & CStr(accumulated) & " | key=" & key)
@@ -323,18 +330,21 @@ Module OBS ' Observability_ErrorHandler VER 1.0.3
 		WriteLogFile(line)
 		' sink 호출 (재진입 방지: sink 내부에서 cehLog 호출 시 무한루프 차단)
 		If Thread.TestAndSet(emitting, 1) = 0 Then
-			For i = 0 To sinkCount - 1
-				sink = sinkList(i)
-				If Not sink Is Nothing Then
-					Try
-						sink(line)
-					Catch sinkEx
-						' sink 실패는 콘솔에만 남기고 메인 로그 경로를 보호한다.
-						Console.WriteLine(BuildPrefix("OBS.EmitLogLine") & " WARN: sink(" & CStr(i) & ") failed: " & sinkEx.Message())
-					End Try
-				End If
-			Next
-			Thread.TestAndSet(emitting, 0) ' 원자적 리셋 (단순 대입 시 멀티스레드 경쟁 조건 방지)
+			Try
+				For i = 0 To sinkCount - 1
+					sink = sinkList(i)
+					If Not sink Is Nothing Then
+						Try
+							sink(line)
+						Catch sinkEx
+							' sink 실패는 콘솔에만 남기고 메인 로그 경로를 보호한다.
+							Console.WriteLine(BuildPrefix("LOG.EmitLogLine") & " WARN: sink(" & CStr(i) & ") failed: " & sinkEx.Message())
+						End Try
+					End If
+				Next
+			Finally
+				Thread.TestAndSet(emitting, 0) ' 원자적 리셋 (단순 대입 시 멀티스레드 경쟁 조건 방지)
+			End Try
 		End If
 	End Sub
 

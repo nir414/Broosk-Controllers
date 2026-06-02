@@ -5,7 +5,7 @@
 ' - (none)
 'Used by:
 ' - CEH, Net_Tcp_*, Storage_*, Data_*, ORCH_Main
-Module FND ' Foundation_Utils VER 1.0.2
+Module FND ' Foundation_Utils VER 1.0.3
 	' 기본적인 함수나 변수들을 모아 놓은 모듈이다.
 	'
 	'=========================
@@ -15,6 +15,7 @@ Module FND ' Foundation_Utils VER 1.0.2
 	Public Const LF As String = Chr(10)
 	Public Const CRLF As String = CR & LF ' FND.CRLF
 	Public Const TAB As String = Chr(9)
+	Public Const ROMDISK_TMP_PREFIX As String = "/ROMDISK/tmp/"
 	
 	Public Function timeString() As String
 		Return Controller.PDB(121)

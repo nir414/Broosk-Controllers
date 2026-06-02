@@ -1,9 +1,64 @@
 {
 	"gpl.trace.server": "verbose",
-	"gpl.controller.ip": "192.168.0.2",
 	"gpl.controller.port": 1402,
 	"gpl.controller.consolePort": 1403,
 	"gpl.controller.timeoutMs": 10000,
 	"gpl.controller.ftpBasePath": "/GPL",
-	"gpl.controller.threadPollIntervalMs": 5000
+	"gpl.controller.threadPollIntervalMs": 5000,
+	"files.exclude": {
+		".history": true,
+		"tools/node_modules": true
+	},
+	"search.exclude": {
+		".history": true,
+		"tools/node_modules": true
+	},
+	"files.watcherExclude": {
+		"**/.history/**": true,
+		"tools/node_modules/**": true
+	},
+	"chat.tools.terminal.autoApprove": {
+		"Start-Sleep": true,
+		"Write-Output": true,
+		"/^Test-NetConnection 192\\.168\\.0\\.2 -Port 1402 \\| Select-Object -Property ComputerName,RemotePort,TcpTestSucceeded; Test-NetConnection 192\\.168\\.0\\.2 -Port 1403 \\| Select-Object -Property ComputerName,RemotePort,TcpTestSucceeded$/": {
+			"approve": true,
+			"matchCommandLine": true
+		},
+		"/^\\$logPath = Join-Path \\$env:TEMP 'Robot\\.log'; if \\(Test-Path \\$logPath\\) \\{ Select-String -Path \\$logPath -Pattern 'Program start\\|Program end\\|APON COVERAGE TEST START\\|\\\\\\[C\\\\\\*\\\\\\]\\|StoreCompare\\|MultiDim\\|AponEdges' \\| Select-Object -Last 40 \\| ForEach-Object \\{ \\$_\\.Line \\} \\} else \\{ Write-Output 'Robot\\.log not found in TEMP' \\}$/": {
+			"approve": true,
+			"matchCommandLine": true
+		},
+		"/^\\$pwd\\.Path; Test-NetConnection 192\\.168\\.0\\.2 -Port 1402 \\| Select-Object ComputerName,RemotePort,TcpTestSucceeded; Test-NetConnection 192\\.168\\.0\\.2 -Port 1403 \\| Select-Object ComputerName,RemotePort,TcpTestSucceeded$/": {
+			"approve": true,
+			"matchCommandLine": true
+		},
+		"/^\\$client = \\[System\\.Net\\.Sockets\\.TcpClient\\]::new\\(\\); try \\{ \\$client\\.ReceiveTimeout = 10000; \\$client\\.SendTimeout = 5000; \\$client\\.Connect\\('192\\.168\\.0\\.2', 1403\\); if \\(-not \\$client\\.Connected\\) \\{ Write-Output 'CONNECT_FAIL'; exit 2 \\}; \\$stream = \\$client\\.GetStream\\(\\); \\$buffer = New-Object byte\\[\\] 4096; \\$read = \\$stream\\.Read\\(\\$buffer,0,\\$buffer\\.Length\\); if \\(\\$read -gt 0\\) \\{ \\$text = \\[System\\.Text\\.Encoding\\]::ASCII\\.GetString\\(\\$buffer,0,\\$read\\); Write-Output \\('READ_BYTES=' \\+ \\$read\\); Write-Output '--- SAMPLE_START ---'; Write-Output \\$text; Write-Output '--- SAMPLE_END ---' \\} else \\{ Write-Output 'READ_BYTES=0' \\} \\} catch \\{ Write-Output \\('ERR=' \\+ \\$_\\.Exception\\.Message\\); exit 1 \\} finally \\{ if \\(\\$stream\\) \\{ \\$stream\\.Dispose\\(\\) \\}; if \\(\\$client\\) \\{ \\$client\\.Close\\(\\) \\} \\}$/": {
+			"approve": true,
+			"matchCommandLine": true
+		},
+		"/^Set-Location \"c:\\\\Users\\\\Doyun\\\\Documents\\\\GitHub\\\\RND 로봇\\\\Broosk Controllers\"; node \\.\\\\tools\\\\fetch-robot-log\\.mjs 192\\.168\\.0\\.2 /ROMDISK/tmp/Robot\\.log; \\$logPath = Join-Path \\$env:TEMP 'Robot\\.log'; Select-String -Path \\$logPath -Pattern '\\\\\\[AponCoverage\\\\\\]\\|Program start\\|Program end\\|\\\\\\[C\\\\\\*\\\\\\]\\|\\\\\\[E\\\\\\*\\\\\\]' \\| Select-Object -Last 20 \\| ForEach-Object \\{ \\$_\\.Line \\}$/": {
+			"approve": true,
+			"matchCommandLine": true
+		},
+		"/^\\$hostIp = '192\\.168\\.0\\.2'; \\$port = 1402; \\$payload = '<COMMAND><NAME>GetProjectList</NAME></COMMAND>'; \\$client = \\[System\\.Net\\.Sockets\\.TcpClient\\]::new\\(\\); try \\{ \\$client\\.Connect\\(\\$hostIp, \\$port\\); \\$stream = \\$client\\.GetStream\\(\\); \\$bytes = \\[System\\.Text\\.Encoding\\]::ASCII\\.GetBytes\\(\\$payload\\); \\$stream\\.Write\\(\\$bytes, 0, \\$bytes\\.Length\\); \\$stream\\.Flush\\(\\); \\$buffer = New-Object byte\\[\\] 8192; \\$sb = \\[System\\.Text\\.StringBuilder\\]::new\\(\\); do \\{ \\$read = \\$stream\\.Read\\(\\$buffer, 0, \\$buffer\\.Length\\); if \\(\\$read -le 0\\) \\{ break \\}; \\[void\\]\\$sb\\.Append\\(\\[System\\.Text\\.Encoding\\]::ASCII\\.GetString\\(\\$buffer, 0, \\$read\\)\\); \\} while \\(-not \\$sb\\.ToString\\(\\)\\.Contains\\('</STATUS>'\\)\\); \\$resp = \\$sb\\.ToString\\(\\); Write-Output \\$resp \\} finally \\{ if \\(\\$client\\.Connected\\) \\{ \\$client\\.Close\\(\\) \\} \\}$/": {
+			"approve": true,
+			"matchCommandLine": true
+		},
+		"/^node \\.\\\\tools\\\\fetch-robot-log\\.mjs 192\\.168\\.0\\.2 /ROMDISK/tmp/Robot\\.log$/": {
+			"approve": true,
+			"matchCommandLine": true
+		},
+		"/^\\$log = Join-Path \\$env:TEMP 'Robot\\.log'; \\$patterns = 'MODULE TEST SUITE START','MODULE TEST SUITE END','STORE COMPARE TEST START','STORE COMPARE TEST END','MULTI-DIM PATTERN TEST START','MULTI-DIM PATTERN TEST END','APON EDGES TEST START','APON EDGES TEST END','APON COVERAGE TEST START','APON COVERAGE TEST END'; Select-String -Path \\$log -Pattern \\$patterns \\| Select-Object LineNumber, Line \\| Format-Table -AutoSize \\| Out-String -Width 240$/": {
+			"approve": true,
+			"matchCommandLine": true
+		},
+		"/^\\$p = Join-Path \\$env:TEMP 'Robot\\.log'; if \\(Test-Path \\$p\\) \\{ Write-Output \"FOUND:\\$p\"; Get-Item \\$p \\| Select-Object FullName,Length,LastWriteTime \\| Format-List; Write-Output '---TAIL---'; Get-Content \\$p -Tail 220 \\} else \\{ Write-Output \"MISSING:\\$p\" \\}$/": {
+			"approve": true,
+			"matchCommandLine": true
+		},
+		"/^Set-Location \"c:\\\\Users\\\\Doyun\\\\Documents\\\\GitHub\\\\RND 로봇\\\\Broosk Controllers\"; Test-NetConnection 192\\.168\\.0\\.2 -Port 1402 \\| Select-Object ComputerName,RemotePort,TcpTestSucceeded; Test-NetConnection 192\\.168\\.0\\.2 -Port 1403 \\| Select-Object ComputerName,RemotePort,TcpTestSucceeded$/": {
+			"approve": true,
+			"matchCommandLine": true
+		}
+	}
 }

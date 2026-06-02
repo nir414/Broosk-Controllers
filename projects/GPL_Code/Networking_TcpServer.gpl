@@ -5,23 +5,28 @@
 ' - Socket I/O: 수신/송신 경로의 예외 처리/디버그/락 정책
 ' - Command Handler: TCP 수신 라인(명령) 파싱/처리 결정
 ' - Server Loop: accept/session/receive/line dispatch
-' - TcpCommunication: 연결 오케스트레이션 (thread per connection) + session registry
+' - TcpServer: 포트별 서버 객체 (생성자 자동 시작) + command pump + thread-per-connection 동시 다중 접속
 '
 'Requires:
 ' - Concurrency_SpinLock.gpl        (Module SNC): SpinLock 클래스
-' - Networking_TcpCommandQueue.gpl  (Module NCQ): 채널 큐 관리, TcpCommandQueueChannel
+' - TcpCmdQueue.gpl                 (Module NCQ): 채널 큐 관리, TcpCommandQueueChannel
 ' - Parsing_StringUtils.gpl         (Module PRS): SplitOnce/SafeTrim
-' - Observability_ErrorHandler.gpl  (Module OBS): 로그/예외 기록, LogSinkSub Delegate
+' - Observability_Logger.gpl        (Module LOG): 로그/예외 기록, LogSinkSub Delegate
 ' - Foundation_Utils.gpl            (Module FND): CRLF, timeString
 'Used by:
-' - Orchestration_Main (TcpCommunication 인스턴스 생성/StopAll)
+' - Orchestration_Main (Module ORCH_Main): NET.TcpServer 인스턴스 생성 (포트별)
 '
 ' 사용 예 (Orchestration_Main 등 엔트리 포인트에서):
-'   Dim tcp As New TcpCommunication("192.168.0.1", "5000")
-'   OBS.RegisterLogSink(AddressOf NET.ForwardLogLine)
-Module NET ' Networking_TcpServer VER 1.0.1
-	
-	
+'   Dim s4000 As New NET.TcpServer(4000)   ' 생성자에서 listen + command pump 자동 시작
+'   (선택) s4000.SetCommandHandler(AddressOf MyModule.OnTcpCommand)
+Module NET ' Networking_TcpServer VER 1.0.11
+
+	' TCP 명령 핸들러 Delegate (외부 모듈 확장 포인트)
+	' SetCommandHandler로 등록하면 command pump가 수신 라인마다 호출한다.
+	' 미등록 시 기본 동작은 RX 로그 출력.
+	Public Delegate Sub TcpCommandHandlerSub(ByVal serverIndex As Integer, ByVal port As String, ByVal line As String)
+
+
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 	'''''''''''''''''''''''''''' TcpSession '''''''''''''''''''''''''
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -97,7 +102,7 @@ Module NET ' Networking_TcpServer VER 1.0.1
 			End Get
 			Set(value As Socket)
 				If value Is Nothing Then
-					OBS.cehLog("TcpSession.Socket Set - value is Nothing (ignored)", "NET.TcpSession")
+					LOG.cehLog("TcpSession.Socket Set - value is Nothing (ignored)", "NET.TcpSession")
 				Else
 					m_socket = value
 				End If
@@ -106,7 +111,7 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		
 		Public Sub AttachSocket(ByVal sock As Socket)
 			If sock Is Nothing Then
-				OBS.cehLog("TcpSession.AttachSocket - sock is Nothing (ignored)", "NET.TcpSession")
+				LOG.cehLog("TcpSession.AttachSocket - sock is Nothing (ignored)", "NET.TcpSession")
 				Exit Sub
 			End If
 			m_socket = sock
@@ -140,7 +145,8 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		End Sub
 		
 		Public Sub SendLine(ByVal line As String)
-			SendSocketLine(m_socket, line, m_sendLock)
+			If line Is Nothing Then line = ""
+			SendSocket(m_socket, line & FND.CRLF, m_sendLock)
 		End Sub
 		
 		
@@ -154,7 +160,7 @@ Module NET ' Networking_TcpServer VER 1.0.1
 			Try
 				m_socket.Close
 			Catch ex
-				OBS.cehLogEx(ex, "TcpSession.CloseSocket")
+				LOG.cehLogEx(ex, "TcpSession.CloseSocket")
 			End Try
 			' NOTE: Socket에 Nothing 대입 금지 (크래시 버그 방지)
 		End Sub
@@ -172,8 +178,9 @@ Module NET ' Networking_TcpServer VER 1.0.1
 	' TryReceiveOnce: TCP 소켓에서 1회 수신 시도
 	' Return:
 	'   1 = 데이터 수신 성공
-	'   0 = 연결 종료 / stop 요청 / 소켓 없음
-	'  -1 = 수신 에러
+	'   0 = idle timeout / 데이터 없음
+	'  -1 = 연결 종료 / stop 요청 / 소켓 없음
+	'  -2 = 수신 에러
 	Public Function TryReceiveOnce(ByVal clientSocket As Socket, ByVal timeoutMs As Integer, ByVal stopping As Integer, ByVal debugOn As Integer, ByRef buf As String, ByRef ret As Integer, ByVal logContext As String) As Integer
 		Dim ex As Exception
 		
@@ -181,28 +188,36 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		ret = 0
 		
 		If clientSocket Is Nothing Then
-			TryReceiveOnce = 0
+			TryReceiveOnce = -1
 			Exit Function
 		End If
 		
 		Try
 			ret = clientSocket.Receive(buf, timeoutMs)
-			If ret <= 0 Then
+			If stopping <> 0 Then
+				TryReceiveOnce = -1
+				Exit Function
+			End If
+			If ret < 0 Then
+				TryReceiveOnce = -1
+				Exit Function
+			End If
+			If ret = 0 Then
 				TryReceiveOnce = 0
 				Exit Function
 			End If
 			If debugOn = 1 Then
-				OBS.cehLog("Received | Len: " & CStr(ret), logContext)
+				LOG.cehLog("Received | Len: " & CStr(ret), logContext)
 			End If
 			TryReceiveOnce = 1
 		Catch ex
 			' stop 과정에서 socket close로 인한 예외는 정상 종료로 간주
 			If stopping <> 0 Then
-				TryReceiveOnce = 0
+				TryReceiveOnce = -1
 				Exit Function
 			End If
-			OBS.cehLogEx(ex, logContext & " - Receive failed")
-			TryReceiveOnce = -1
+			LOG.cehLogEx(ex, logContext & " - Receive failed")
+			TryReceiveOnce = -2
 		End Try
 	End Function
 	
@@ -217,15 +232,9 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		Try
 			sock.Send(data)
 		Catch ex
-			OBS.cehLogExThrottled(ex, "NET.SendSocket | len=" & CStr(Len(data)), "NET.Send", 1000)
+			LOG.cehLogExThrottled(ex, "NET.SendSocket | len=" & CStr(Len(data)), "NET.Send", 1000)
 		End Try
 		sendLock.Release()
-	End Sub
-	
-	' SendSocketLine: 단일 Socket 대상으로 line 송신 (CRLF 자동 추가)
-	Public Sub SendSocketLine(ByVal sock As Socket, ByVal line As String, ByVal sendLock As SpinLock)
-		If line Is Nothing Then line = ""
-		SendSocket(sock, line & FND.CRLF, sendLock)
 	End Sub
 	
 	
@@ -287,7 +296,7 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		End If
 		
 		If debugOn = 1 Then
-			OBS.cehLog("Command | " & cmd & " | Args: " & args, "NET.EvaluateLine")
+			LOG.cehLog("Command | " & cmd & " | Args: " & args, "NET.EvaluateLine")
 		End If
 		
 		' === Built-in commands (즉시 처리, 큐 미사용) ===
@@ -355,13 +364,20 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		Dim ex As Exception
 		If session Is Nothing Then Exit Sub
 		
-		Dim endPoint As New IPEndPoint(session.Ip, session.Port)
+		' 바인딩 주소: GPL 문서상 와일드카드(any address)는 빈 문자열 ""이다.
+		' ("0.0.0.0"은 리터럴 주소로 해석돼 바인딩 실패 가능)
+		' 컨트롤러 서버 IP는 고정이므로 특정 IP 대신 와일드카드로 listen한다.
+		Dim bindIp As String
+		bindIp = PRS.SafeTrim(session.Ip)
+		If bindIp = "0.0.0.0" Then bindIp = ""
+		' IPEndPoint 포트는 숫자형 (0~65535)
+		Dim endPoint As New IPEndPoint(bindIp, CInt(session.Port))
 		Dim listener As New TcpListener(endPoint)
 		
 		Try
 			listener.Start
 		Catch ex
-			OBS.cehLogEx(ex, "NET.RunServerLoopForSession - Listener start failed")
+			LOG.cehLogEx(ex, "NET.RunServerLoopForSession - Listener start failed")
 			Exit Sub
 		End Try
 		
@@ -374,10 +390,12 @@ Module NET ' Networking_TcpServer VER 1.0.1
 				If TryAcceptSocket(listener, clientSocket) = 0 Then
 					Thread.Sleep(200)
 				Else
-					HandleClientSession(session, clientSocket, stopping, debugOn)
+					' 동시 다중 접속: accept된 소켓마다 워커 스레드 + 독립 세션을 띄우고
+					' listener는 즉시 다음 accept로 돌아간다 (블로킹하지 않음).
+					TcpServer.StartClientWorker(session, clientSocket)
 				End If
 			Catch ex
-				OBS.cehLogEx(ex, "NET.RunServerLoopForSession - Unhandled")
+				LOG.cehLogEx(ex, "NET.RunServerLoopForSession - Unhandled")
 				Thread.Sleep(200)
 			End Try
 		End While
@@ -386,7 +404,7 @@ Module NET ' Networking_TcpServer VER 1.0.1
 			listener.Stop
 			listener.Close
 		Catch ex
-			OBS.cehLogEx(ex, "NET.RunServerLoopForSession - Listener cleanup failed")
+			LOG.cehLogEx(ex, "NET.RunServerLoopForSession - Listener cleanup failed")
 		End Try
 	End Sub
 	
@@ -413,7 +431,7 @@ Module NET ' Networking_TcpServer VER 1.0.1
 			clientSocket = listener.AcceptSocket
 			TryAcceptSocket = 1
 		Catch ex
-			OBS.cehLogEx(ex, "NET.TryAcceptSocket")
+			LOG.cehLogEx(ex, "NET.TryAcceptSocket")
 			TryAcceptSocket = 0
 		End Try
 	End Function
@@ -427,7 +445,7 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		clientSocket.ReceiveTimeout = 0
 		clientSocket.KeepAlive = True
 		
-		OBS.cehLog("Client connected", "NET.HandleClientSession")
+		LOG.cehLog("Client connected", "NET.HandleClientSession")
 		Thread.Sleep(200)
 		session.SendLine(FND.timeString() & " start(" & Thread.CurrentThread.Name & ")")
 		
@@ -435,7 +453,7 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		
 		' IMPORTANT: session.Socket = Nothing 금지 (크래시 버그 방지)
 		session.CloseSocket()
-		OBS.cehLog("Connection closed", "NET.HandleClientSession")
+		LOG.cehLog("Connection closed", "NET.HandleClientSession")
 	End Sub
 	
 	Private Sub ReceiveLoop(ByVal session As TcpSession, ByVal clientSocket As Socket, ByRef stopping As Integer, ByVal debugOn As Integer)
@@ -451,12 +469,14 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		While isConnected = 1 And stopping = 0
 			Dim buf As String
 			Dim ret As Integer
+			Dim recvStatus As Integer
 			buf = ""
 			
-			If TryReceiveOnce(clientSocket, 2000, stopping, debugOn, buf, ret, "NET.ReceiveLoop") = 1 Then
+			recvStatus = TryReceiveOnce(clientSocket, 2000, stopping, debugOn, buf, ret, "NET.ReceiveLoop")
+			If recvStatus = 1 Then
 				recvBuf &= buf
 				ProcessRecvLines(session, recvBuf, debugOn)
-			Else
+			ElseIf recvStatus < 0 Then
 				isConnected = 0
 			End If
 		End While
@@ -539,14 +559,17 @@ Module NET ' Networking_TcpServer VER 1.0.1
 	
 	
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-	'''''''''''''''''''''' TcpCommunication '''''''''''''''''''''''''
+	''''''''''''''''''''''''''' TcpServer '''''''''''''''''''''''''''
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-	
-	' TCP communication orchestration (thread per connection) + session registry
-	' - 연결별 TcpSession + TcpCommandQueueChannel 자동 바인딩
-	' - OBS 로그 sink 등록으로 TCP 클라이언트에 로그 포워딩 지원
-	
-	Public Class TcpCommunication
+
+	' 포트별 TCP 서버 객체 (object-based, 생성자에서 자동 시작)
+	' - New(port): listener 스레드 + command pump 스레드를 즉시 시작한다.
+	' - SetCommandHandler(handler): 인스턴스별 수신 명령 핸들러 (미등록 시 RX 로그).
+	' - 동시 다중 접속: accept된 클라이언트마다 워커 스레드 + 독립 TcpSession (clientSessions).
+	'   연결별 I/O는 분리되지만 명령 큐(NCQ 채널=serverIndex)는 포트 단위로 공유한다.
+	' - 세션 레지스트리/stopping/debug 등은 transport 공용(Shared) 상태로 유지한다.
+
+	Public Class TcpServer
 		
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		''''''''''''''''''''''' SHARED STATE ''''''''''''''''''''''''
@@ -558,13 +581,22 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		' Shared 데이터 보호: Thread.TestAndSet 기반 (SpinLock 클래스 Shared 초기화 불확실 방지)
 		Private Shared Dim initLockState As Integer
 		Private Shared Dim TcpCount As Integer
-		
-		
+		' 인프라 1회 초기화 가드
+		Private Shared Dim m_infraInit As Integer
+		' serverIndex(슬롯)별 수신 명령 핸들러 (미등록 시 pump는 RX 로그만 남긴다).
+		' Shared 배열 + index 키 방식 (GPL 미검증 키워드 Me 회피).
+		Private Shared Dim s_handlers() As TcpCommandHandlerSub
+		' 동시 다중 접속: accept된 클라이언트 연결별 세션 (슬롯 재사용, 끊기면 해제)
+		Private Shared Dim clientSessions() As TcpSession
+		Private Shared Dim activeClientCount As Integer
+
+
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		'''''''''''''''''''''' INSTANCE STATE '''''''''''''''''''''''
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-		
+
 		Private Dim index As Integer
+		Private Dim m_port As Integer
 		Private Dim m_session As TcpSession
 		Private Dim m_queue As TcpCommandQueueChannel
 		
@@ -588,26 +620,48 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		'''''''''''''''''''''' CONSTRUCTOR ''''''''''''''''''''''''''
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		
-		Public Sub New(IP As String, PORT As String)
-			Dim currentCount As Integer
+		' 포트별 서버 생성 + 자동 시작.
+		' - 바인딩은 와일드카드("") = any address (서버 IP 고정).
+		' - listener + command pump 스레드를 즉시 시작한다.
+		Public Sub New(ByVal port As Integer)
+			Dim portText As String
 			Dim session As TcpSession
-			
-			index = AllocateSlot(IP, PORT)
-			If index < 0 Then
-				OBS.cehLog("AllocateSlot failed | IP: " & IP & ", Port: " & PORT, "TcpCommunication.New")
+			Dim listenThread As Thread
+
+			index = -1
+			m_port = port
+			If port <= 0 Then
+				LOG.cehLog("Invalid port: " & CStr(port), "TcpServer.New")
 				Exit Sub
 			End If
-			currentCount = TcpCount
+
+			EnsureInfra()
+			portText = CStr(port)
+			If IsPortListening(portText) = 1 Then
+				LOG.cehLog("Port already listening | " & portText, "TcpServer.New")
+				Exit Sub
+			End If
+
+			' "" = 와일드카드 바인딩 (any address)
+			index = AllocateSlot("", portText)
+			If index < 0 Then
+				LOG.cehLog("AllocateSlot failed | Port: " & portText, "TcpServer.New")
+				Exit Sub
+			End If
 			If TryGetSessionByIndex(index, session) = 1 Then
 				m_session = session
 				m_queue = session.Queue
 			End If
-			
+
 			' Thread 생성: GPL Thread.New 규칙에 따라 "ClassName.MethodName" 형식
-			Dim TcpCommunicationThread As New Thread("TcpCommunication.TcpCommunicationThreadFunc",,"TCPCOM" & CStr(currentCount))
-			TcpCommunicationThread.Argument = index
-			TcpCommunicationThread.Start
-			OBS.cehLog("Thread started | Index: " & CStr(index) & ", Count: " & CStr(currentCount) & ", IP: " & IP & ", Port: " & PORT, "TcpCommunication.New")
+			listenThread = New Thread("TcpServer.TcpServerListenThreadFunc",,"TCPLSN" & portText)
+			listenThread.Argument = index
+			listenThread.Start
+
+			' 포트별 command pump 스레드 시작
+			StartPump(index)
+
+			LOG.cehLog("TcpServer listening | :" & portText & " | Index=" & CStr(index), "TcpServer.New")
 		End Sub
 		
 		
@@ -615,10 +669,16 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		'''''''''''''''''''''' SHARED API '''''''''''''''''''''''''''
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		
+		' 현재 listen 중인 서버(포트) 수.
 		Public Shared Function GetConnectionCount() As Integer
 			GetConnectionCount = TcpCount
 		End Function
-		
+
+		' 현재 접속 중인 클라이언트 연결 수 (동시 다중 접속).
+		Public Shared Function GetActiveClientCount() As Integer
+			GetActiveClientCount = activeClientCount
+		End Function
+
 		Public Shared Sub SetDebug(ByVal enable As Integer)
 			If enable <> 0 Then
 				debugOn = 1
@@ -626,42 +686,40 @@ Module NET ' Networking_TcpServer VER 1.0.1
 				debugOn = 0
 			End If
 		End Sub
-		
+
+		' Reply/ReplyLine: sourceIndex(서버 포트) 소속 클라이언트들에게 송신.
+		' - 한 포트에 여러 클라이언트가 붙어 있으면 모두에게 전달된다.
 		Public Shared Sub Reply(ByVal sourceIndex As Integer, ByVal data As String)
-			Dim session As TcpSession
-			If TryGetSessionByIndex(sourceIndex, session) = 0 Then Exit Sub
-			session.Send(data)
+			SendToClients(sourceIndex, data, 0)
 		End Sub
-		
+
 		Public Shared Sub ReplyLine(ByVal sourceIndex As Integer, ByVal line As String)
-			Dim session As TcpSession
-			If TryGetSessionByIndex(sourceIndex, session) = 0 Then Exit Sub
-			session.SendLine(line)
+			SendToClients(sourceIndex, line, 1)
 		End Sub
-		
+
 		Public Shared Sub StopAll()
-			Dim ex As Exception
 			Dim i As Integer
 			Dim session As TcpSession
+			' listener 루프 + command pump + receive 루프 모두 stopping으로 종료
 			stopping = 1
-			If sessions Is Nothing Then Exit Sub
-			For i = 0 To TcpCount - 1
-				If TryGetSessionByIndex(i, session) = 1 Then
+			If clientSessions Is Nothing Then Exit Sub
+			For i = 0 To clientSessions.Length - 1
+				If TryGetClientSessionByIndex(i, session) = 1 Then
 					session.CloseSocket()
 				End If
 			Next
 		End Sub
-		
-		' BroadcastLine: 모든 활성 세션에 라인을 송신한다.
+
+		' BroadcastLine: 모든 활성 클라이언트 연결에 라인을 송신한다.
 		' - 로그 sink(ForwardLogLine)에서 사용한다.
 		Public Shared Sub BroadcastLine(ByVal line As String)
 			Dim i As Integer
 			Dim session As TcpSession
 			Dim ex As Exception
-			If sessions Is Nothing Then Exit Sub
+			If clientSessions Is Nothing Then Exit Sub
 			If stopping <> 0 Then Exit Sub
-			For i = 0 To TcpCount - 1
-				If TryGetSessionByIndex(i, session) = 1 Then
+			For i = 0 To clientSessions.Length - 1
+				If TryGetClientSessionByIndex(i, session) = 1 Then
 					Try
 						session.SendLine(line)
 					Catch ex
@@ -670,8 +728,171 @@ Module NET ' Networking_TcpServer VER 1.0.1
 				End If
 			Next
 		End Sub
+
+		' sourceIndex 소속 클라이언트들에게 송신 (sendAsLine=1이면 CRLF 부가).
+		Private Shared Sub SendToClients(ByVal sourceIndex As Integer, ByVal data As String, ByVal sendAsLine As Integer)
+			Dim i As Integer
+			Dim session As TcpSession
+			Dim ex As Exception
+			If data Is Nothing Then Exit Sub
+			If data = "" Then Exit Sub
+			If clientSessions Is Nothing Then Exit Sub
+			If stopping <> 0 Then Exit Sub
+			For i = 0 To clientSessions.Length - 1
+				If TryGetClientSessionByIndex(i, session) = 1 Then
+					If session.Id = sourceIndex Then
+						Try
+							If sendAsLine = 1 Then
+								session.SendLine(data)
+							Else
+								session.Send(data)
+							End If
+						Catch ex
+							LOG.cehLogEx(ex, "TcpServer.SendToClients")
+						End Try
+					End If
+				End If
+			Next
+		End Sub
 		
 		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' SERVER CONTROL ''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		' 이 서버의 listen 포트.
+		Public Function Port() As Integer
+			Port = m_port
+		End Function
+
+		' 수신 명령 핸들러 등록 (선택, 인스턴스별). 미등록 시 pump는 RX 로그만 남긴다.
+		Public Sub SetCommandHandler(ByVal handler As TcpCommandHandlerSub)
+			SetHandlerForIndex(index, handler)
+		End Sub
+
+		' serverIndex의 listen 포트 문자열 조회 (세션 레지스트리 기반).
+		Public Shared Function GetServerPort(ByVal serverIndex As Integer) As String
+			Dim session As TcpSession
+			GetServerPort = ""
+			If TryGetSessionByIndex(serverIndex, session) = 0 Then Exit Function
+			If session.Port Is Nothing Then Exit Function
+			GetServerPort = session.Port
+		End Function
+
+		' 인프라 1회 초기화: 큐 리셋 + 로그 sink 등록 (idempotent).
+		Private Shared Sub EnsureInfra()
+			Dim doInit As Integer
+			doInit = 0
+			AcquireInitLock()
+			If m_infraInit = 0 Then
+				m_infraInit = 1
+				doInit = 1
+			End If
+			ReleaseInitLock()
+			If doInit = 1 Then
+				NCQ.ResetAll()
+				LOG.RegisterLogSink(New LogSinkSub(AddressOf ForwardLogLine))
+			End If
+		End Sub
+
+		' 동일 포트가 이미 listen 중인지 검사 (중복 시작 방지). 1=listen중, 0=아님
+		Private Shared Function IsPortListening(ByVal portText As String) As Integer
+			Dim i As Integer
+			Dim session As TcpSession
+			IsPortListening = 0
+			If portText Is Nothing Then Exit Function
+			If portText = "" Then Exit Function
+			For i = 0 To TcpCount - 1
+				If TryGetSessionByIndex(i, session) = 1 Then
+					If session.Port = portText Then
+						IsPortListening = 1
+						Exit Function
+					End If
+				End If
+			Next
+		End Function
+
+		' 포트별 command pump 스레드 시작.
+		Private Shared Sub StartPump(ByVal serverIndex As Integer)
+			Dim pumpThread As Thread
+			Dim portText As String
+			If serverIndex < 0 Then Exit Sub
+			portText = GetServerPort(serverIndex)
+			If portText = "" Then portText = CStr(serverIndex)
+			' Thread 생성: GPL Thread.New 규칙에 따라 "ClassName.MethodName" 형식
+			pumpThread = New Thread("TcpServer.TcpCommandPumpThreadFunc",,"TCPCMD" & portText)
+			pumpThread.Argument = serverIndex
+			pumpThread.Start
+			LOG.cehLog("TCP command pump started | Server=" & CStr(serverIndex) & " | Port=" & portText, "NET.StartPump")
+		End Sub
+
+		' Command pump 워커: 채널(serverIndex)에서 수신 라인을 꺼내 dispatch.
+		' CRITICAL: 스레드 밖으로 예외가 전파되면 컨트롤러 런타임 다운 가능.
+		Public Shared Sub TcpCommandPumpThreadFunc()
+			Dim ex As Exception
+			Dim serverIndex As Integer
+			Dim line As String
+			Dim portText As String
+			Try
+				serverIndex = Thread.CurrentThread.Argument
+				portText = GetServerPort(serverIndex)
+				If portText = "" Then portText = "?"
+				While stopping = 0
+					line = ""
+					If NCQ.TryDequeueFor(serverIndex, line) = 1 Then
+						DispatchCommand(serverIndex, portText, line)
+					Else
+						Thread.Sleep(100)
+					End If
+				End While
+			Catch ex
+				LOG.cehLogEx(ex, "NET.TcpCommandPumpThreadFunc")
+			End Try
+		End Sub
+
+		' 수신 명령 1건 처리: serverIndex별 등록 핸들러로 전달 (없으면 RX 로그).
+		Private Shared Sub DispatchCommand(ByVal serverIndex As Integer, ByVal portText As String, ByVal line As String)
+			Dim ex As Exception
+			Dim handler As TcpCommandHandlerSub
+			handler = GetHandlerForIndex(serverIndex)
+			If handler Is Nothing Then
+				LOG.cehLog("TCP CMD RX | Server=" & CStr(serverIndex) & " | Port=" & portText & " | " & line, "TcpServer.Pump")
+				Exit Sub
+			End If
+			Try
+				handler(serverIndex, portText, line)
+			Catch ex
+				LOG.cehLogEx(ex, "TcpServer.DispatchCommand - handler failed")
+			End Try
+		End Sub
+
+		' serverIndex(슬롯)별 핸들러 저장 (인스턴스 SetCommandHandler에서 호출).
+		Private Shared Sub SetHandlerForIndex(ByVal slotIndex As Integer, ByVal handler As TcpCommandHandlerSub)
+			If slotIndex < 0 Then Exit Sub
+			AcquireInitLock()
+			If s_handlers Is Nothing Then
+				ReDim s_handlers(slotIndex)
+			ElseIf slotIndex >= s_handlers.Length Then
+				ReDim Preserve s_handlers(slotIndex)
+			End If
+			s_handlers(slotIndex) = handler
+			ReleaseInitLock()
+		End Sub
+
+		' serverIndex(슬롯)별 핸들러 조회 (없으면 Nothing).
+		Private Shared Function GetHandlerForIndex(ByVal slotIndex As Integer) As TcpCommandHandlerSub
+			GetHandlerForIndex = Nothing
+			If slotIndex < 0 Then Exit Function
+			AcquireInitLock()
+			If Not s_handlers Is Nothing Then
+				If slotIndex < s_handlers.Length Then
+					GetHandlerForIndex = s_handlers(slotIndex)
+				End If
+			End If
+			ReleaseInitLock()
+		End Function
+
+
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		'''''''''''''''''''''' INSTANCE API ''''''''''''''''''''''''
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -722,26 +943,71 @@ Module NET ' Networking_TcpServer VER 1.0.1
 		'''''''''''''''''' WORKER ENTRYPOINT ''''''''''''''''''''''''
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		
-		Public Shared Sub TcpCommunicationThreadFunc()
+		Public Shared Sub TcpServerListenThreadFunc()
 			Dim ex As Exception
 			Dim slotIndex As Integer
 			Dim session As TcpSession
-			
+
 			' CRITICAL: 스레드 밖으로 예외가 전파되면 컨트롤러 런타임 다운 가능
 			Try
 				slotIndex = Thread.CurrentThread.Argument
-				
+
 				If TryGetSessionByIndex(slotIndex, session) = 0 Then
-					OBS.cehLog("Invalid slotIndex or no session: " & CStr(slotIndex), "TcpCommunication.ThreadFunc")
+					LOG.cehLog("Invalid slotIndex or no session: " & CStr(slotIndex), "TcpServer.ListenThreadFunc")
 					Exit Sub
 				End If
 				RunServerLoopForSession(session, stopping, debugOn)
 			Catch ex
-				OBS.cehLogEx(ex, "TcpCommunication.ThreadFunc - Unhandled")
+				LOG.cehLogEx(ex, "TcpServer.ListenThreadFunc - Unhandled")
 			End Try
 		End Sub
-		
-		
+
+		' accept된 클라이언트 소켓마다 독립 세션 등록 + 워커 스레드 시작.
+		' - listener 스레드는 이 호출 후 즉시 다음 accept로 돌아간다 (동시 다중 접속).
+		Public Shared Sub StartClientWorker(ByVal serverSession As TcpSession, ByVal clientSocket As Socket)
+			Dim clientIndex As Integer
+			Dim clientThread As Thread
+			Dim ex As Exception
+			If serverSession Is Nothing Then Exit Sub
+			If clientSocket Is Nothing Then Exit Sub
+
+			clientIndex = RegisterClientSession(serverSession, clientSocket)
+			If clientIndex < 0 Then
+				Try
+					clientSocket.Close
+				Catch ex
+					LOG.cehLogEx(ex, "TcpServer.StartClientWorker - Close failed")
+				End Try
+				Exit Sub
+			End If
+
+			' Thread 생성: GPL Thread.New 규칙에 따라 "ClassName.MethodName" 형식
+			clientThread = New Thread("TcpServer.TcpClientSessionThreadFunc",,"TCPCLI" & CStr(clientIndex))
+			clientThread.Argument = clientIndex
+			clientThread.Start
+		End Sub
+
+		' 클라이언트 연결 1개를 처리하는 워커 스레드 본체.
+		' CRITICAL: 스레드 밖으로 예외가 전파되면 컨트롤러 런타임 다운 가능.
+		Public Shared Sub TcpClientSessionThreadFunc()
+			Dim ex As Exception
+			Dim clientIndex As Integer
+			Dim session As TcpSession
+			Try
+				clientIndex = Thread.CurrentThread.Argument
+				If TryGetClientSessionByIndex(clientIndex, session) = 0 Then
+					LOG.cehLog("Invalid clientIndex or no session: " & CStr(clientIndex), "TcpServer.ClientThreadFunc")
+					Exit Sub
+				End If
+				HandleClientSession(session, session.Socket, stopping, debugOn)
+			Catch ex
+				LOG.cehLogEx(ex, "TcpServer.ClientThreadFunc - Unhandled")
+			Finally
+				UnregisterClientSession(clientIndex)
+			End Try
+		End Sub
+
+
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		'''''''''''''''' SESSION REGISTRY (PRIVATE) ''''''''''''''''
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -755,7 +1021,7 @@ Module NET ' Networking_TcpServer VER 1.0.1
 			maxChannels = NCQ.MAX_CHANNELS
 			If TcpCount >= maxChannels Then
 				ReleaseInitLock()
-				OBS.cehLog("Too many connections (max=" & CStr(maxChannels) & ")", "TcpCommunication.AllocateSlot")
+				LOG.cehLog("Too many connections (max=" & CStr(maxChannels) & ")", "TcpServer.AllocateSlot")
 				AllocateSlot = -1
 				Exit Function
 			End If
@@ -805,7 +1071,98 @@ Module NET ' Networking_TcpServer VER 1.0.1
 				TryGetSessionByIndex = 1
 			End If
 		End Function
-		
+
+		' 클라이언트 연결 세션 등록: 빈 슬롯 재사용, 없으면 배열 확장. Return: clientIndex / -1
+		' - 연결별 독립 TcpSession이지만 명령 큐(Queue)는 서버 채널을 공유한다
+		'   (포트별 pump가 단일 채널에서 읽으므로).
+		Private Shared Function RegisterClientSession(ByVal serverSession As TcpSession, ByVal clientSocket As Socket) As Integer
+			Dim clientIndex As Integer
+			Dim i As Integer
+			Dim clientSession As TcpSession
+			RegisterClientSession = -1
+			If serverSession Is Nothing Then Exit Function
+			If clientSocket Is Nothing Then Exit Function
+
+			AcquireInitLock()
+			clientIndex = -1
+			If Not clientSessions Is Nothing Then
+				For i = 0 To clientSessions.Length - 1
+					If clientSessions(i) Is Nothing Then
+						clientIndex = i
+						Exit For
+					End If
+				Next
+			End If
+			If clientIndex < 0 Then
+				If clientSessions Is Nothing Then
+					ReDim clientSessions(0)
+					clientIndex = 0
+				Else
+					clientIndex = clientSessions.Length
+					ReDim Preserve clientSessions(clientIndex)
+				End If
+			End If
+
+			clientSession = New TcpSession(serverSession.Id, serverSession.Ip, serverSession.Port)
+			clientSession.Queue = serverSession.Queue
+			clientSession.AttachSocket(clientSocket)
+			clientSessions(clientIndex) = clientSession
+			activeClientCount += 1
+			ReleaseInitLock()
+
+			RegisterClientSession = clientIndex
+		End Function
+
+		' 클라이언트 연결 세션 해제 (슬롯 재사용 가능 상태로). 연결 종료 시 호출.
+		Private Shared Sub UnregisterClientSession(ByVal clientIndex As Integer)
+			If clientIndex < 0 Then Exit Sub
+			AcquireInitLock()
+			If Not clientSessions Is Nothing Then
+				If clientIndex < clientSessions.Length Then
+					If Not clientSessions(clientIndex) Is Nothing Then
+						clientSessions(clientIndex) = Nothing
+						If activeClientCount > 0 Then
+							activeClientCount -= 1
+						End If
+					End If
+				End If
+			End If
+			ReleaseInitLock()
+		End Sub
+
+		' clientIndex -> 클라이언트 세션 조회 (1=있음, 0=없음).
+		Private Shared Function TryGetClientSessionByIndex(ByVal clientIndex As Integer, ByRef session As TcpSession) As Integer
+			Dim ok As Integer
+			session = Nothing
+			If clientIndex < 0 Then
+				TryGetClientSessionByIndex = 0
+				Exit Function
+			End If
+
+			ok = 1
+			AcquireInitLock()
+			If clientSessions Is Nothing Then
+				ok = 0
+			ElseIf clientIndex >= clientSessions.Length Then
+				ok = 0
+			Else
+				session = clientSessions(clientIndex)
+			End If
+			ReleaseInitLock()
+
+			If ok = 0 Then
+				session = Nothing
+				TryGetClientSessionByIndex = 0
+				Exit Function
+			End If
+
+			If session Is Nothing Then
+				TryGetClientSessionByIndex = 0
+			Else
+				TryGetClientSessionByIndex = 1
+			End If
+		End Function
+
 	End Class
 	
 	
@@ -813,11 +1170,12 @@ Module NET ' Networking_TcpServer VER 1.0.1
 	'''''''''''''''''''''''' Log Sink '''''''''''''''''''''''''''''''
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 	
-	' OBS.RegisterLogSink(AddressOf NET.ForwardLogLine)으로 등록하면
-	' OBS.EmitLogLine에서 이 함수를 호출해 모든 TCP 세션에 로그를 포워딩한다.
+	' LOG.RegisterLogSink(AddressOf NET.ForwardLogLine)으로 등록하면
+	' LOG.EmitLogLine에서 이 함수를 호출해 모든 TCP 세션에 로그를 포워딩한다.
 	Public Sub ForwardLogLine(line As String)
 		If line Is Nothing Then line = ""
-		TcpCommunication.BroadcastLine(line)
+		TcpServer.BroadcastLine(line)
 	End Sub
 	
 End Module
+

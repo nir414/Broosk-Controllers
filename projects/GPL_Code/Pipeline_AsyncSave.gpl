@@ -2,22 +2,18 @@
 'Requires:
 ' - Concurrency_RingQueue (RingQueue_StringPair)
 ' - Concurrency_SpinLock (in-flight/completed 상태 보호)
-' - Core_FileStore (CFS: SafeSaveFile + read/exists/restore)
-' - Observability_ErrorHandler (로그/예외 기록)
+' - Persistence_FileStore (PST: SafeSaveFile + read/exists/restore)
+' - Observability_Logger (로그/예외 기록)
 'Used by:
 ' - DAT(Format_DatStore), ORCH_Main
-Module PIP ' Pipeline_AsyncSave VER 1.0.1
+Module PIP ' Pipeline_AsyncSave VER 1.0.6
 
 	' 고정 크기 circular queue (ring buffer)
 	Private Const QUEUE_MAX As Integer = 64
 	Private Dim q As RingQueue_StringPair = New RingQueue_StringPair(QUEUE_MAX)
 
-	' dispatcher thread 제어
+	' worker thread 제어
 	Private Dim started As Integer ' Ensure로 1회만 시작
-
-	' 동적 스레드 이름 생성용 카운터
-	Private Dim threadIdCounter As Integer
-	Private Dim threadIdLock As New SpinLock
 
 	' debug log 토글 (1=on, 0=off)
 	Private Dim debugOn As Integer
@@ -34,6 +30,8 @@ Module PIP ' Pipeline_AsyncSave VER 1.0.1
 	Private Dim completedCount As Integer
 	Private Dim completedLock As New SpinLock
 	Private Dim lastCompletedTick As Double
+	Private Dim failedCount As Integer
+	Private Dim failedLock As New SpinLock
 
 	' NOTE:
 	' - 큐 구현(링버퍼/락/진단)은 Concurrency_RingQueue로 공통화합니다.
@@ -45,50 +43,9 @@ Module PIP ' Pipeline_AsyncSave VER 1.0.1
 	' NOTE:
 	' - q는 선언 시점에 생성한다. (불필요한 lazy init/과보호 제거)
 
-	Private Sub IncrementInFlight()
-		inFlightLock.Acquire()
-		inFlight = inFlight + 1
-		inFlightLock.Release()
-	End Sub
-
-	Private Sub DecrementInFlight()
-		inFlightLock.Acquire()
-		If inFlight > 0 Then
-			inFlight = inFlight - 1
-		End If
-		inFlightLock.Release()
-	End Sub
-
-	Private Function GetInFlight() As Integer
-		inFlightLock.Acquire()
-		GetInFlight = inFlight
-		inFlightLock.Release()
-	End Function
-
-	Private Sub MarkCompleted()
-		completedLock.Acquire()
-		completedCount += 1
-		lastCompletedTick = Controller.Timer(1) * 1000
-		completedLock.Release()
-	End Sub
-
 	'=========================
 	' diagnostic helpers (public)
 	'=========================
-	' 누적 처리 완료 횟수(성공/실패/skip 포함)
-	Public Function GetCompletedCount() As Integer
-		completedLock.Acquire()
-		GetCompletedCount = completedCount
-		completedLock.Release()
-	End Function
-
-	' 마지막 완료 시각(ms) (Controller.Timer(1) 기반)
-	Public Function GetLastCompletedTick() As Double
-		completedLock.Acquire()
-		GetLastCompletedTick = lastCompletedTick
-		completedLock.Release()
-	End Function
-
 	Private Function Dequeue(ByRef path As String, ByRef xml As String) As Integer
 		Dequeue = q.TryDequeue(path, xml)
 	End Function
@@ -121,29 +78,18 @@ Module PIP ' Pipeline_AsyncSave VER 1.0.1
 	'=========================
 	' Public API
 	'=========================
-	' dispatcher를 1회만 시작 (idempotent)
+	' 저장 워커를 1회만 시작 (idempotent)
 	Public Sub Ensure()
 		If Thread.TestAndSet(started, 1) = 0 Then
-			Dim d As New Thread("PIP.DispatcherFunc", , "AsyncSaveDispatch")
-			d.Start
+			Dim worker As New Thread("PIP.WorkerLoop", , "AsyncSave")
+			worker.Start
 		End If
 	End Sub
 
-	' 동적 스레드용 고유 ID 발급
-	Private Function NextThreadId() As Integer
-		threadIdLock.Acquire()
-		threadIdCounter = threadIdCounter + 1
-		NextThreadId = threadIdCounter
-		threadIdLock.Release()
-	End Function
-
 	' debug logging on/off
 	Public Sub SetDebug(ByVal enable As Integer)
-		If enable <> 0 Then
-			debugOn = 1
-		Else
-			debugOn = 0
-		End If
+		debugOn = 0
+		If enable <> 0 Then debugOn = 1
 	End Sub
 
 	' enqueue; overflow 시 가장 오래된 항목 drop
@@ -168,12 +114,16 @@ Module PIP ' Pipeline_AsyncSave VER 1.0.1
 	' queue가 빌 때까지 대기 (timeoutMs < 0 이면 무한대기)
 	' 모두 비우면 1, 타임아웃이면 0 반환
 	Public Function Flush(ByVal timeoutMs As Integer) As Integer
+		Dim inFlightNow As Integer
 		Dim remaining As Integer
 		remaining = timeoutMs
 		While True
 			' 의미: 큐가 비었고 + 워커가 처리 중인 작업도 없을 때만 완료로 본다.
 			If PendingCount() <= 0 Then
-				If GetInFlight() = 0 Then
+				inFlightLock.Acquire()
+				inFlightNow = inFlight
+				inFlightLock.Release()
+				If inFlightNow = 0 Then
 					Flush = 1
 					Exit Function
 				End If
@@ -198,63 +148,58 @@ Module PIP ' Pipeline_AsyncSave VER 1.0.1
 	End Function
 
 	'=========================
-	'	Dispatcher: 큐 감시 → 필요한 수만큼만 워커 스레드 동적 생성
-	'	인플라이트(inFlight) 기반 과잉 생성 방지:
-	'	  newWorkers = pending - inFlight (≥0 보장)
-	'	  → 이미 처리 중인 워커가 충분하면 추가 생성 안 함
+	'	WorkerLoop: 단일 long-lived worker
+	'	- 컨트롤러 런타임에서 저장 요청 수만큼 스레드를 생성하지 않도록 제한한다.
+	'	- Flush는 pending=0 + inFlight=0일 때만 완료로 본다.
 	'=========================
-	Public Sub DispatcherFunc()
-		Dim pending As Integer
-		Dim flying As Integer
-		Dim newWorkers As Integer
-		Dim i As Integer
-		Dim t As Thread
-		While True
-			lastWorkerActiveTick = Controller.Timer(1) * 1000
-			pending = PendingCount()
-			If pending > 0 Then
-				flying = GetInFlight()
-				newWorkers = pending - flying
-				If newWorkers > 0 Then
-					For i = 1 To newWorkers
-						IncrementInFlight()
-						t = New Thread("PIP.OneOffWorker", , "Save" & CStr(NextThreadId()))
-						t.Start
-					Next
-				End If
-			End If
-			Thread.Sleep(20)
-		End While
-	End Sub
-
-	'=========================
-	'	1회성 워커: dequeue → save → 종료
-	'=========================
-	Public Sub OneOffWorker()
+	Public Sub WorkerLoop()
 		Dim p As String
 		Dim x As String
 		Dim lenX As Integer
+		Dim saveResult As Integer
 		Dim ex As New Exception
-		If Dequeue(p, x) = 1 Then
-			Try
-				If p <> "" Then
-					Dim saveResult As Integer
-					saveResult = PST.SafeSaveFile(p, x, 1) ' 백업 포함 저장
-					If saveResult = PST.SAVE_SUCCESS Then
-						If debugOn = 1 Then
-							lenX = Len(x)
-							OBS.cehLog("Saved | " & p & " (" & CStr(lenX) & "c)", "AsyncSave.Worker")
+
+		While True
+			lastWorkerActiveTick = Controller.Timer(1) * 1000
+			If Dequeue(p, x) = 1 Then
+				inFlightLock.Acquire()
+				inFlight = inFlight + 1
+				inFlightLock.Release()
+				Try
+					If p <> "" Then
+						saveResult = PST.SafeSaveFile(p, x, 1) ' 백업 포함 저장
+						If saveResult = PST.SAVE_SUCCESS Then
+							If debugOn = 1 Then
+								lenX = Len(x)
+								LOG.cehLog("Saved | " & p & " (" & CStr(lenX) & "c)", "AsyncSave.Worker")
+							End If
+						Else
+							failedLock.Acquire()
+							failedCount += 1
+							failedLock.Release()
+							LOG.cehLog("Save failed | " & p & " | Err:" & CStr(saveResult), "AsyncSave.Worker")
 						End If
-					Else
-						OBS.cehLog("Save failed | " & p & " | Err:" & CStr(saveResult), "AsyncSave.Worker")
 					End If
-				End If
-			Catch ex
-				OBS.cehLogEx(ex, "AsyncSave.Worker | " & p)
-			End Try
-			MarkCompleted()
-		End If
-		DecrementInFlight()
+				Catch ex
+					failedLock.Acquire()
+					failedCount += 1
+					failedLock.Release()
+					LOG.cehLogEx(ex, "AsyncSave.Worker | " & p)
+				Finally
+					completedLock.Acquire()
+					completedCount += 1
+					lastCompletedTick = Controller.Timer(1) * 1000
+					completedLock.Release()
+					inFlightLock.Acquire()
+					If inFlight > 0 Then
+						inFlight = inFlight - 1
+					End If
+					inFlightLock.Release()
+				End Try
+			Else
+				Thread.Sleep(20)
+			End If
+		End While
 	End Sub
 
 	'=========================
