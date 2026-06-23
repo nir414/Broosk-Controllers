@@ -1,0 +1,186 @@
+'Created: 2026/06/02
+'Purpose: TCP 명령 프로토콜 계층 (전송 계층과 분리)
+' - TCP 수신 라인(명령)의 파싱/처리 결정 로직만 담는다.
+' - 소켓/세션/스레드 등 전송 계층(Module NET)과 의존성이 없다(line in -> 결정 out).
+' - 실제 송신/큐 적재/소켓 I/O는 호출자(Module NET의 Server Loop)가 수행한다.
+'
+'Requires:
+' - Parsing_StringUtils.gpl          (Module PRS): SplitOnce/SafeTrim
+' - Debug_Telemetry.gpl              (Module DBG): TryHandleCommand (DBG:* 명령 라우팅)
+' - Observability_Logger.gpl         (Module LOG): 로그 기록
+' - Concurrency_SpinLock.gpl         (Module SNC): SpinLock (비동기 명령 레지스트리 보호)
+'Used by:
+' - Networking_TcpServer (Module NET): HandleCommandLine에서 NPR.EvaluateLine 호출
+Module NPR ' Networking_TcpProtocol VER 1.0.2
+
+	' === 비동기 도메인 명령 레지스트리 ===
+	' 등록된 명령(대문자 이름 일치)은 EvaluateLine에서 즉시 처리 대신 큐 적재
+	' (shouldEnqueue=1)로 분류된다. command pump 스레드가 큐에서 꺼내 처리하고,
+	' 결과는 발신 연결(connId)로 회신한다 (Module NET 참고).
+	' 등록은 기동 시(서버 시작 전) 수행을 전제로 하되, 동시 접근을 SpinLock으로 보호한다.
+	Private Dim s_asyncCmds() As String
+	Private Dim s_asyncCount As Integer
+	Private Dim s_asyncLock As New SpinLock
+
+	' EvaluateLine: TCP 수신 line 1개를 파싱하고 처리 action 결정
+	' Input:
+	'  - line       : 수신된 명령 라인(raw)
+	'  - debugOn    : 디버그 로그 출력 여부 (1=on, 0=off)
+	'  - echoMode   : 에코 모드 상태 (ByRef, ECHO 명령으로 변경 가능)
+	' Output (ByRef):
+	'  - shouldEnqueue/enqueueText : 큐 적재 여부(1=yes, 0=no) 및 내용
+	'  - shouldEcho/echoText       : 에코 응답 여부(1=yes, 0=no) 및 내용
+	'  - replyLine1/replyLine2     : 즉시 응답 라인(최대 2개)
+	Public Sub EvaluateLine(ByVal line As String, ByVal debugOn As Integer, ByRef echoMode As Boolean, ByRef shouldEnqueue As Integer, ByRef enqueueText As String, ByRef shouldEcho As Integer, ByRef echoText As String, ByRef replyLine1 As String, ByRef replyLine2 As String)
+		Dim cmd As String
+		Dim args As String
+		Dim argsUpper As String
+		Dim left As String
+		Dim right As String
+		Dim splitOk As Integer
+
+		' defaults
+		shouldEnqueue = 0
+		enqueueText = ""
+		shouldEcho = 0
+		echoText = ""
+		replyLine1 = ""
+		replyLine2 = ""
+
+		If line Is Nothing Then line = ""
+
+		' cmd/args 파싱 (첫 공백 기준)
+		splitOk = PRS.SplitOnce(line, " ", left, right)
+		If splitOk = 1 Then
+			cmd = PRS.SafeTrim(left)
+			args = PRS.SafeTrim(right)
+		Else
+			cmd = PRS.SafeTrim(line)
+			args = ""
+		End If
+
+		' cmd는 비교용으로 대문자 정규화
+		cmd = PRS.SafeTrim(cmd)
+		If cmd <> "" Then
+			cmd = cmd.ToUpper()
+		End If
+
+		' args 대문자 버전 (비교용)
+		argsUpper = PRS.SafeTrim(args)
+		If argsUpper <> "" Then
+			argsUpper = argsUpper.ToUpper()
+		End If
+
+		If debugOn = 1 Then
+			LOG.cehLog("Command | " & cmd & " | Args: " & args, "NPR.EvaluateLine")
+		End If
+
+		' 에코: 수신 라인을 그대로 미러링한다(시간/부가정보 없음). 기본 OFF.
+		' ECHO 1 로 켜면 라인 프로토콜 수신을 원문 그대로 확인하는 용도.
+		If echoMode Then
+			shouldEcho = 1
+			echoText = line
+		End If
+
+		' === Built-in commands (즉시 처리, 큐 미사용) ===
+		If cmd = "PING" Then
+			replyLine1 = "PONG"
+			Exit Sub
+		ElseIf cmd = "HELP" Then
+			replyLine1 = "OK CMDS: PING, HELP, ECHO 0|1, DBG:*"
+			Exit Sub
+		ElseIf cmd = "ECHO" Then
+			If argsUpper = "1" Or argsUpper = "ON" Then
+				echoMode = True
+				replyLine1 = "OK ECHO=1"
+			ElseIf argsUpper = "0" Or argsUpper = "OFF" Then
+				echoMode = False
+				replyLine1 = "OK ECHO=0"
+			Else
+				replyLine1 = "ERR ECHO expects 0|1"
+			End If
+			Exit Sub
+		End If
+
+		' === Sync extension hook (DBG:* 등 즉시 처리 명령) ===
+		If TryHandleCustom(cmd, args, argsUpper, line, debugOn, echoMode, shouldEnqueue, enqueueText, shouldEcho, echoText, replyLine1, replyLine2) = 1 Then
+			Exit Sub
+		End If
+
+		' === 비동기 도메인 명령: 등록되어 있으면 큐 적재 (pump가 처리 후 발신 연결로 회신) ===
+		' 즉시 ACK("OK QUEUED ...")만 보내고, 실제 처리 결과는 command pump 스레드가
+		' 비동기로 발신 연결에 회신한다. 적재 텍스트는 원문 라인 그대로(핸들러가 재파싱).
+		If IsAsyncCommand(cmd) = 1 Then
+			shouldEnqueue = 1
+			enqueueText = line
+			replyLine1 = "OK QUEUED " & cmd
+			Exit Sub
+		End If
+
+		' === 미인식 명령: 노이즈 없이 단일 에러로만 응답 ===
+		' 시간표시/큐 적재/로그 포워딩 없음. 클라이언트는 이 한 줄로 인식 실패를 명확히 확인한다.
+		replyLine1 = "ERR UNKNOWN CMD"
+	End Sub
+
+	' TryHandleCustom: 커스텀 명령 처리 훅
+	' Return: 1=handled, 0=not handled (기본 처리로 진행)
+	' DBG 모듈의 TCP 명령(DBG:SNAP / DBG:WATCH / DBG:CLEAR / DBG:VERBOSE / DBG:STATUS)을 라우팅한다.
+	Public Function TryHandleCustom(ByVal cmd As String, ByVal args As String, ByVal argsUpper As String, ByVal rawLine As String, ByVal debugOn As Integer, ByRef echoMode As Boolean, ByRef shouldEnqueue As Integer, ByRef enqueueText As String, ByRef shouldEcho As Integer, ByRef echoText As String, ByRef replyLine1 As String, ByRef replyLine2 As String) As Integer
+		If DBG.TryHandleCommand(cmd, args, argsUpper, replyLine1, replyLine2) = 1 Then
+			Return 1
+		End If
+		Return 0
+	End Function
+
+	' RegisterAsyncCommand: 비동기 도메인 명령 등록 (이름은 대문자로 정규화해 비교).
+	' 등록된 명령은 큐 적재 → command pump 처리 → 발신 연결 회신 경로를 탄다.
+	' 중복 등록은 무시한다(idempotent).
+	Public Sub RegisterAsyncCommand(ByVal name As String)
+		Dim i As Integer
+		If name Is Nothing Then Exit Sub
+		name = PRS.SafeTrim(name)
+		If name = "" Then Exit Sub
+		name = name.ToUpper()
+
+		s_asyncLock.Acquire()
+		For i = 0 To s_asyncCount - 1
+			If s_asyncCmds(i) = name Then
+				s_asyncLock.Release()
+				Exit Sub
+			End If
+		Next
+		If s_asyncCmds Is Nothing Then
+			ReDim s_asyncCmds(0)
+		ElseIf s_asyncCount >= s_asyncCmds.Length Then
+			ReDim Preserve s_asyncCmds(s_asyncCount)
+		End If
+		s_asyncCmds(s_asyncCount) = name
+		s_asyncCount += 1
+		s_asyncLock.Release()
+	End Sub
+
+	' ClearAsyncCommands: 등록된 비동기 명령 전체 해제 (테스트/재구성용).
+	Public Sub ClearAsyncCommands()
+		s_asyncLock.Acquire()
+		s_asyncCount = 0
+		s_asyncCmds = Nothing
+		s_asyncLock.Release()
+	End Sub
+
+	' IsAsyncCommand: cmd(대문자)가 등록된 비동기 명령인지 (1=yes, 0=no).
+	Public Function IsAsyncCommand(ByVal cmdUpper As String) As Integer
+		Dim i As Integer
+		IsAsyncCommand = 0
+		If cmdUpper Is Nothing Then Exit Function
+		If cmdUpper = "" Then Exit Function
+		s_asyncLock.Acquire()
+		For i = 0 To s_asyncCount - 1
+			If s_asyncCmds(i) = cmdUpper Then
+				IsAsyncCommand = 1
+				Exit For
+			End If
+		Next
+		s_asyncLock.Release()
+	End Function
+
+End Module

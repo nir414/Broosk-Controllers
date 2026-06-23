@@ -1,0 +1,109 @@
+'Created: 12/4/2013 9:30:07 AM
+Module INIT_IO_CONFIG
+
+	'''''''' default address setting '''''''
+	Public Dim DI_BASE As Integer = 10001
+	Public Dim DO_BASE As Integer = 13
+	
+	Public Dim DI_BASE_RIO As Integer = 20001
+	Public Dim DO_BASE_RIO As Integer = 20033
+	
+	Public Dim SYS_DO_INTERLOCK As Integer = 13
+	Public Dim SYS_DO_INTERLOCK_COUNT As Integer = 3
+	Public Dim SYS_DO_INTERLOCK_ENABLE As Integer = 16
+	
+	Public Dim SYS_DI_AUTO_MANUAL_SW As Integer = 10009
+	'''''''' default address setting '''''''
+	
+	Public Dim SYS_DO_RUN As Integer = 17
+	Public Dim SYS_DO_STOP As Integer = 18
+	Public Dim SYS_DO_ORIGIN_COMPLETED As Integer = 19
+	Public Dim SYS_DO_ALARM As Integer = 20
+	
+	Public Sub RobotIOUpdate()
+		Dim ex As Exception
+		
+		If Signal.DIO(18003) Or Signal.DIO(18004) Or Signal.DIO(18012) Then ' hard emo 
+			If errorHandler.getCurrentError() Is Nothing Then
+				ex = errorHandler.makeUserException(ERR_EMERGENCY)
+				errorHandler.handleError(ex)
+			End If
+		End If
+		
+		Signal.DIO(SYS_DO_RUN) = myRobot(0).isOpCommandRunningNow()
+		Signal.DIO(SYS_DO_STOP) = Not(myRobot(0).isOpCommandRunningNow())
+		Signal.DIO(SYS_DO_ORIGIN_COMPLETED) = myRobot(0).isOrgCompleted
+
+		If errorHandler.getCurrentError() Is Nothing Then
+				Signal.DIO(SYS_DO_ALARM) = False
+		Else
+				Signal.DIO(SYS_DO_ALARM) = True
+		End If
+	End Sub
+	
+    Public Class VirtualIOMap
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''' PRIVATE ''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	
+		Private Const MAX_DIO_BITCOUNT As Integer = 40
+		
+		Private virtualDI(MAX_DIO_BITCOUNT) As Boolean
+		Public ReadOnly Property vDI(addr As Integer) As Boolean
+			Get
+				If addr < 0 Or addr > MAX_DIO_BITCOUNT Then
+					Return False
+				Else
+					Return virtualDI(addr)
+				End If
+			End Get
+		End Property
+		
+		Private virtualDO(MAX_DIO_BITCOUNT) As Boolean
+		Public ReadOnly Property vDO(addr As Integer) As Boolean
+			Get
+				If addr < 0 Or addr > MAX_DIO_BITCOUNT Then
+					Return False
+				Else
+					Return virtualDO(addr)
+				End If
+			End Get
+		End Property
+		
+		
+		
+		
+		
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''' PUBLIC '''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		
+		Public Sub New()
+			Dim i As Integer
+			For i = 0 To MAX_DIO_BITCOUNT
+				virtualDI(i) = False
+				virtualDO(i) = False
+			Next i
+		End Sub
+		
+		Public Sub loadVirtualDI()
+
+			
+		End Sub
+		
+		Public Sub loadVirtualDO()
+
+		End Sub
+		
+		Public Sub setDOBit(addr As Integer, flag As Boolean)
+			Select addr
+			Case 8
+'				Signal.DIO(20033) = flag ' vacuum grip sol - U
+			Case 15
+'				Signal.DIO(20040) = flag ' safety module reset 
+			End Select
+		End Sub
+		
+	End Class
+End Module

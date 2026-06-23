@@ -1,0 +1,9 @@
+'2026-06-04 오전 10:32:38
+ProjectBegin
+ProjectName="MergeCode"
+ProjectStart="Main"
+ProjectSource="__init__IOConfig__.gpl"
+ProjectSource="__init__RobotConfig__.gpl"
+ProjectSource="GModule.gpo"
+ProjectSource="MergeCode.gpl"
+ProjectEnd

@@ -1,0 +1,475 @@
+'Created: 2026/06/15
+'Module: RBT (Robotics_Robot)
+'Purpose: Joint Only(Kinematic Module #1) 로봇 제어 facade + JointRobot 클래스
+' - Brooks/Precise Guidance 컨트롤러의 내장 Robot/Move/Profile/Location 객체를 감싼다.
+' - Joint Only 모듈은 Cartesian Location/모션, Robot.Base/Tool, Move.Extra를 지원하지 않는다.
+'   따라서 본 모듈은 "관절(Joint) 좌표" 제어만 노출한다. (직선/직교 모션 미제공)
+' - 운동학 모듈 번호는 "Robot type"(DataID 116)에 1을 넣어 선택한다(필요 software license: None).
+'   축 개수는 "Number of axes"(DataID 2000)로 1~12축까지 설정 가능하며 본 모듈은 런타임에 자동 조회한다.
+'Requires:
+' - Observability_Logger.gpl (Module LOG): cehLog / cehLogEx
+'Used by:
+' - 엔트리 포인트(ORCH_Main 등)에서 New RBT.JointRobot(robotNum) 으로 사용
+'
+' 사용 예 (호출 스레드 1개에서):
+'   Dim r As New RBT.JointRobot(1)   ' 1번 로봇 객체 (Joint Only 가정)
+'   r.LogConfig()                    ' (선택) 로봇타입/축개수 로그
+'   r.PowerOn()                      ' 서보 파워 On (완료까지 대기)
+'   r.Home()                         ' 호밍 (블로킹)
+'   Dim target(r.AxisCount - 1) As Double
+'   target(0) = 10.0 : target(1) = -20.0   ' 단위: 회전축=deg, 직선축=mm
+'   r.MoveJoint(target)              ' 기본 프로파일로 관절 이동 (비동기 시작)
+'   r.WaitDone()                     ' 모션 완료 대기
+'
+' NOTE(스레딩): GPL의 Robot.Attached는 "호출 스레드"에 로봇을 귀속시킨다.
+'   따라서 한 JointRobot 인스턴스의 이동 명령은 attach한 스레드와 동일한 스레드에서 호출해야 한다.
+Module RBT ' Robotics_Robot VER 1.0.0
+
+	'=========================
+	' Public constants
+	'=========================
+	' 운동학 모듈 번호: 1 = Joint Only
+	Public Const KIN_JOINT_ONLY As Integer = 1
+
+	' Parameter Database(PDB) DataID
+	Public Const PDB_ROBOT_TYPE As Integer = 116  ' "Robot type" (운동학 모듈 번호)
+	Public Const PDB_NUM_AXES   As Integer = 2000 ' "Number of axes" (1~12)
+
+	' 알려진 GPL 예외 코드 (KDY_Module 관측값 기준)
+	Public Const ERR_ALREADY_ATTACHED As Integer = -1006 ' 다른 스레드가 이미 attach
+	Public Const ERR_POWER_OFF        As Integer = -1600 ' 파워 Off 진행 중 (재시도 가능)
+
+	' Joint Only는 최대 12축
+	Public Const MAX_JOINT_AXES As Integer = 12
+
+
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+	'''''''''''''''''''''''''' JointRobot '''''''''''''''''''''''''''
+	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+	' Joint Only 로봇 1대를 캡슐화한다.
+	' - 내장 Robot/Move 객체를 감싸 attach/power/home/관절이동/정지/상태조회를 제공한다.
+	' - Cartesian 관련 API는 의도적으로 노출하지 않는다(Joint Only 미지원).
+	Public Class JointRobot
+
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		''''''''''''''''''''''''' PRIVATE '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		Private Dim m_robotNum As Integer     ' 로봇 번호 (1-base, Robot.Attached/Selected 값)
+		Private Dim m_axisCount As Integer    ' 캐시된 축 개수 (DataID 2000)
+
+		' 기본 프로파일 파라미터 (MoveJoint/MoveOneAxis에서 프로파일 미지정 시 사용)
+		' Joint Only이므로 Straight는 항상 False(관절 보간). 직선 보간은 불가.
+		Private Dim m_defSpeed     As Double = 20.0  ' 속도 [%] (안전하게 느린 기본값)
+		Private Dim m_defAccel     As Double = 100.0 ' 가속 [%]
+		Private Dim m_defDecel     As Double = 100.0 ' 감속 [%]
+		Private Dim m_defAccelRamp As Double = 0.15  ' 가속 ramp [s]
+		Private Dim m_defDecelRamp As Double = 0.15  ' 감속 ramp [s]
+		Private Dim m_defInRange   As Double = -1.0  ' In-range: -1 = 종점 도달 시 모션완료(정착대기 안함)
+
+
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' CONSTRUCTOR ''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		' robotNum: 제어할 로봇 번호(1-base). 생성 시 운동학 타입 확인 + 축 개수 자동 조회.
+		Public Sub New(ByVal robotNum As Integer)
+			If robotNum < 1 Then
+				LOG.cehLog("Invalid robotNum: " & CStr(robotNum) & " (1 이상이어야 함). 1로 보정.", "RBT.JointRobot.New")
+				robotNum = 1
+			End If
+			m_robotNum = robotNum
+			m_axisCount = ReadAxisCount()
+			VerifyJointOnly()
+		End Sub
+
+
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''' PROPERTIES '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		Public ReadOnly Property RobotNumber As Integer
+			Get
+				RobotNumber = m_robotNum
+			End Get
+		End Property
+
+		' 제어 축 개수 (DataID 2000). 캐시가 비어 있으면 지연 조회.
+		Public ReadOnly Property AxisCount As Integer
+			Get
+				If m_axisCount <= 0 Then
+					m_axisCount = ReadAxisCount()
+				End If
+				AxisCount = m_axisCount
+			End Get
+		End Property
+
+		' 기본 프로파일 속도 [%] (1~100). MoveJoint/MoveOneAxis 프로파일 미지정 시 적용.
+		Public Property Speed As Double
+			Get
+				Speed = m_defSpeed
+			End Get
+			Set(value As Double)
+				If value < 0.0 Then value = 0.0
+				If value > 100.0 Then value = 100.0
+				m_defSpeed = value
+			End Set
+		End Property
+
+
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''' CONFIG / VERIFY '''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		' DataID 2000(Number of axes)을 읽어 축 개수를 반환. 실패 시 0.
+		Private Function ReadAxisCount() As Integer
+			Dim ex As Exception
+			Dim n As Integer
+			Try
+				n = CInt(Controller.PDB(PDB_NUM_AXES, m_robotNum))
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.ReadAxisCount")
+				Return 0
+			End Try
+			If n < 0 Then n = 0
+			If n > MAX_JOINT_AXES Then n = MAX_JOINT_AXES
+			Return n
+		End Function
+
+		' 현재 운동학 모듈 번호(DataID 116) 반환. 실패 시 -1.
+		Public Function RobotType() As Integer
+			Dim ex As Exception
+			Try
+				RobotType = CInt(Controller.PDB(PDB_ROBOT_TYPE, m_robotNum))
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.RobotType")
+				RobotType = -1
+			End Try
+		End Function
+
+		' Joint Only(=1) 여부. 1=Joint Only, 0=아님.
+		Public Function IsJointOnly() As Integer
+			If RobotType() = KIN_JOINT_ONLY Then
+				IsJointOnly = 1
+			Else
+				IsJointOnly = 0
+			End If
+		End Function
+
+		' Joint Only가 아니면 경고 로그 (강제 변경은 하지 않음).
+		' DataID 116 변경은 보통 컨트롤러 재시작/재커미셔닝이 필요하므로 런타임 자동 변경은 지양한다.
+		Public Sub VerifyJointOnly()
+			Dim t As Integer
+			t = RobotType()
+			If t <> KIN_JOINT_ONLY Then
+				LOG.cehLog("경고: Robot " & CStr(m_robotNum) & " 의 운동학 타입(DataID 116)이 " & CStr(t) & _
+					" 입니다. Joint Only(1)가 아니므로 본 모듈의 관절 제어가 의도대로 동작하지 않을 수 있습니다.", _
+					"RBT.JointRobot.VerifyJointOnly")
+			End If
+		End Sub
+
+		' 설정 요약 로그 (모션 없음, 검증/디버깅용).
+		Public Sub LogConfig()
+			LOG.cehLog("Robot " & CStr(m_robotNum) & " | RobotType(116)=" & CStr(RobotType()) & _
+				" | AxisCount(2000)=" & CStr(AxisCount) & " | JointOnly=" & CStr(IsJointOnly()), _
+				"RBT.JointRobot.LogConfig")
+		End Sub
+
+
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		''''''''''''''''''''''' ATTACH / POWER '''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		' 현재 스레드에 로봇을 attach. 이미 다른 스레드가 점유 중이면(-1006) 예외 전파.
+		Public Sub Attach()
+			Dim ex As Exception
+			Try
+				If Robot.Attached <> m_robotNum Then
+					Robot.Attached = m_robotNum
+				End If
+			Catch ex
+				If ex.ErrorCode = ERR_ALREADY_ATTACHED Then
+					LOG.cehLog("Robot " & CStr(m_robotNum) & " 가 다른 스레드에 이미 attach됨", "RBT.JointRobot.Attach")
+				Else
+					LOG.cehLogEx(ex, "RBT.JointRobot.Attach")
+				End If
+				Throw ex
+			End Try
+		End Sub
+
+		' 로봇 detach (Robot.Attached = 0). 실패는 로그만 남기고 무시.
+		Public Sub Detach()
+			Dim ex As Exception
+			Try
+				Robot.Attached = 0
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.Detach")
+			End Try
+		End Sub
+
+		' 이동 계열 메서드의 공용 가드: 본 스레드에 attach되어 있지 않으면 attach.
+		Private Sub EnsureAttached()
+			If Robot.Attached <> m_robotNum Then
+				Attach()
+			End If
+		End Sub
+
+		' 서보 파워 On. 전원 Off 진행 중(-1600)이면 잠시 후 재시도하고,
+		' 설정 후 PowerEnabled가 켜질 때까지 최대 timeoutMs 동안 대기한다.
+		Public Sub PowerOn()
+			PowerOn(5000)
+		End Sub
+
+		Public Sub PowerOn(ByVal timeoutMs As Integer)
+			SetPower(True)
+			' 고전압 인가는 시간이 걸릴 수 있으므로 켜질 때까지 폴링 (타임아웃 보호).
+			Dim waited As Integer
+			waited = 0
+			While Controller.PowerEnabled = False
+				Thread.Sleep(100)
+				waited = waited + 100
+				If waited >= timeoutMs Then
+					LOG.cehLog("PowerOn 타임아웃: " & CStr(timeoutMs) & "ms 내 파워가 켜지지 않음", "RBT.JointRobot.PowerOn")
+					Exit While
+				End If
+			End While
+		End Sub
+
+		' 서보 파워 Off.
+		Public Sub PowerOff()
+			SetPower(False)
+		End Sub
+
+		Private Sub SetPower(ByVal onFlag As Boolean)
+			Dim ex As Exception
+			Dim tries As Integer
+			tries = 0
+			While True
+				Try
+					If Controller.PowerEnabled <> onFlag Then
+						Controller.PowerEnabled = onFlag
+					End If
+					Exit While
+				Catch ex
+					If ex.ErrorCode = ERR_POWER_OFF Then
+						' 파워 Off 처리 중. 잠시 후 재시도.
+						tries = tries + 1
+						If tries > 20 Then
+							LOG.cehLogEx(ex, "RBT.JointRobot.SetPower - 재시도 한계 초과")
+							Throw ex
+						End If
+						Thread.Sleep(500)
+					Else
+						LOG.cehLogEx(ex, "RBT.JointRobot.SetPower")
+						Throw ex
+					End If
+				End Try
+			End While
+		End Sub
+
+
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		''''''''''''''''''''''''''' HOMING '''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		' 호밍 시퀀스 실행(블로킹). 완료 시 반환. 파워 On 상태여야 한다.
+		Public Sub Home()
+			Dim ex As Exception
+			Try
+				EnsureAttached()
+				Robot.Home
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.Home")
+				Throw ex
+			End Try
+		End Sub
+
+
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		''''''''''''''''''''''' JOINT MOTION '''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		' 전축 관절 이동(기본 프로파일). angles: 0-base 배열, 단위는 축 종류에 따름(deg/mm).
+		' - 비동기 시작. 완료 대기는 WaitDone() 사용.
+		Public Sub MoveJoint(ByVal angles() As Double)
+			MoveJoint(angles, DefaultProfile())
+		End Sub
+
+		' 전축 관절 이동(프로파일 지정).
+		' - 현재 목표 관절 위치(DestAngles, Angles-type)를 복제해 시작하므로
+		'   Joint Only에서도 Location 타입이 항상 올바르게 유지된다(Cartesian 타입 오류 방지).
+		' - angles 길이가 축 개수보다 짧으면 지정된 축만 갱신하고 나머지는 현재값을 유지한다.
+		Public Sub MoveJoint(ByVal angles() As Double, ByVal prof As Profile)
+			Dim ex As Exception
+			Dim loc As Location
+			Dim i As Integer
+			Dim count As Integer
+
+			If angles Is Nothing Then
+				LOG.cehLog("MoveJoint angles가 Nothing", "RBT.JointRobot.MoveJoint")
+				Exit Sub
+			End If
+			If prof Is Nothing Then prof = DefaultProfile()
+
+			Try
+				EnsureAttached()
+
+				' 현재 목표 관절 위치를 기준으로 복제(Angles-type 보장).
+				loc = Robot.DestAngles(m_robotNum).Clone
+
+				count = angles.Length
+				If count > AxisCount Then count = AxisCount
+				' Location.Angle(i)는 1-base 축 인덱스.
+				For i = 1 To count
+					loc.Angle(i) = angles(i - 1)
+				Next i
+
+				Move.Loc(loc, prof)
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.MoveJoint")
+				Throw ex
+			End Try
+		End Sub
+
+		' 단일 축 관절 이동(기본 프로파일).
+		' axis: 1-base 축 인덱스. relative=True면 현재 위치 기준 상대 이동.
+		Public Sub MoveOneAxis(ByVal axis As Integer, ByVal position As Double, ByVal relative As Boolean)
+			MoveOneAxis(axis, position, relative, DefaultProfile())
+		End Sub
+
+		Public Sub MoveOneAxis(ByVal axis As Integer, ByVal position As Double, ByVal relative As Boolean, ByVal prof As Profile)
+			Dim ex As Exception
+			If axis < 1 Or axis > AxisCount Then
+				LOG.cehLog("MoveOneAxis 잘못된 axis: " & CStr(axis) & " (1~" & CStr(AxisCount) & ")", "RBT.JointRobot.MoveOneAxis")
+				Exit Sub
+			End If
+			If prof Is Nothing Then prof = DefaultProfile()
+			Try
+				EnsureAttached()
+				Move.OneAxis(axis, position, relative, prof)
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.MoveOneAxis")
+				Throw ex
+			End Try
+		End Sub
+
+		' 진행 중인 모션이 끝날 때까지 대기(End Of Motion).
+		Public Sub WaitDone()
+			Dim ex As Exception
+			Try
+				Move.WaitForEOM
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.WaitDone")
+				Throw ex
+			End Try
+		End Sub
+
+
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		''''''''''''''''''''''' STATE / STOP '''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		' 현재 목표(commanded) 관절 위치를 outAngles(0-base)에 채우고 축 개수를 반환.
+		' 실패 시 0 반환. (코드베이스 관례: 배열은 ByRef out-parameter로 전달)
+		' NOTE: Robot.DestAngles는 "지령 목표" 관절값이다.
+		Public Function GetCurrentAngles(ByRef outAngles() As Double) As Integer
+			Dim ex As Exception
+			Dim n As Integer
+			Dim loc As Location
+			Dim i As Integer
+			n = AxisCount
+			If n < 1 Then
+				Return 0
+			End If
+			Try
+				loc = Robot.DestAngles(m_robotNum)
+				ReDim outAngles(n - 1)
+				For i = 1 To n
+					outAngles(i - 1) = loc.Angle(i)
+				Next i
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.GetCurrentAngles")
+				Return 0
+			End Try
+			Return n
+		End Function
+
+		' 단일 축의 현재 목표 관절값(1-base 축 인덱스).
+		Public Function CurrentAngle(ByVal axis As Integer) As Double
+			Dim ex As Exception
+			Dim loc As Location
+			If axis < 1 Or axis > AxisCount Then
+				LOG.cehLog("CurrentAngle 잘못된 axis: " & CStr(axis), "RBT.JointRobot.CurrentAngle")
+				Return 0.0
+			End If
+			Try
+				loc = Robot.DestAngles(m_robotNum)
+				CurrentAngle = loc.Angle(axis)
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.CurrentAngle")
+				CurrentAngle = 0.0
+			End Try
+		End Function
+
+		' 모션 진행 여부. 1=이동 중, 0=정지.
+		' TrajState(robot,1) 값 0/5/6 은 정지 상태로 간주(KDY_Module 관측 기준).
+		Public Function IsMoving() As Integer
+			Dim ex As Exception
+			Dim s As Integer
+			Try
+				s = Robot.TrajState(m_robotNum, 1)
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.IsMoving")
+				Return 0
+			End Try
+			If s = 0 Or s = 5 Or s = 6 Then
+				IsMoving = 0
+			Else
+				IsMoving = 1
+			End If
+		End Function
+
+		' 제어 감속 정지(RapidDecel). 궤적을 부드럽게 감속시켜 멈춘다.
+		' (Stop은 BASIC 예약 statement일 수 있어 메서드명을 RapidStop으로 둔다)
+		Public Sub RapidStop()
+			Dim ex As Exception
+			Try
+				Robot.RapidDecel(m_robotNum)
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.RapidStop")
+			End Try
+		End Sub
+
+		' 소프트 비상정지(SoftEStop). 즉시 정지. 재기동 전 해제/복구가 필요할 수 있다.
+		Public Sub EmergencyStop()
+			Dim ex As Exception
+			Try
+				Controller.SoftEStop = True
+			Catch ex
+				LOG.cehLogEx(ex, "RBT.JointRobot.EmergencyStop")
+			End Try
+		End Sub
+
+
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+		'''''''''''''''''''''''' PROFILE '''''''''''''''''''''''''''''
+		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
+
+		' 기본 프로파일 생성. Joint Only이므로 Straight=False(관절 보간) 고정.
+		Public Function DefaultProfile() As Profile
+			Dim p As New Profile
+			p.Speed = m_defSpeed
+			p.Speed2 = 0.0
+			p.Accel = m_defAccel
+			p.Decel = m_defDecel
+			p.AccelRamp = m_defAccelRamp
+			p.DecelRamp = m_defDecelRamp
+			p.Straight = False   ' Joint Only: 직선 보간 금지(관절 보간만)
+			p.InRange = m_defInRange
+			Return p
+		End Function
+
+	End Class
+
+End Module

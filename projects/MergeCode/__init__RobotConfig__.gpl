@@ -1,0 +1,45 @@
+'Created: 11/26/2013 5:18:49 PM
+Module INIT_ROBOT_CONFIG
+
+	Public Dim UseThreeCountErrorCode As Boolean = False
+	Public Dim ShowCommandLogToConsole As Boolean = True
+	Public Dim ResponseEarlyReturnMode As Boolean = False
+	Public Dim ContinuousMotionMode As Boolean = False
+	Public Const UseTP As Boolean = True
+	
+    Public Sub RobotConfig()
+	
+		ContinuousMotionMode = CBool(CInt(theSystem.getValue("ContinuousMotionMode","0")))
+		
+		Dim newRobot As RNDRobot
+		robotCount = 1
+		
+		' ------------- robot1 config setting ----------- start
+		
+		theSystem.ORGBoxHeight = 450
+		theSystem.ORGBoxWidth = 450
+		
+		myRobot(0) = New RNDRobot(1)
+		
+		myRobot(0).robotType = SCARA_TYPE
+		myRobot(0).setRobotAxisName("TZELV") 
+		myRobot(0).setTPAxisName("TZELV")
+		myRobot(0).setDynaxAxisName("TZELV")
+		
+		myRobot(0).setThePointDataManager(New PointDataManager("/flash/data/point1.dat"))
+		myRobot(0).setTheProfileManager(New ProfileManager("/flash/data/profile1.dat"))
+
+		myRobot(0).linkLength = 250
+		
+		Dim arm As RobotArm
+		arm = New RobotArm(1,4,3)
+		arm.armCenterDeg = 0
+		
+		arm.setGripSequence(1,New backTongsGripSequence(New MultiAct(14,13)),False)
+		arm.setFinger(1,"10011,10010,10011")
+		myRobot(0).setArm(arm)
+	
+		' ------------- robot1 config setting ----------- end
+			
+    End Sub 
+End Module

@@ -5,8 +5,8 @@
 ' - Persistence_FileStore (PST: SafeSaveFile + read/exists/restore)
 ' - Observability_Logger (로그/예외 기록)
 'Used by:
-' - DAT(Format_DatStore), ORCH_Main
-Module PIP ' Pipeline_AsyncSave VER 1.0.6
+' - APN(Format_Apon AponStore), ORCH_Main
+Module PIP ' Pipeline_AsyncSave VER 1.0.7
 
 	' 고정 크기 circular queue (ring buffer)
 	Private Const QUEUE_MAX As Integer = 64

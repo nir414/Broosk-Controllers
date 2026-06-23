@@ -1,4 +1,8 @@
 {
+	"gpl.controller.ip": "192.168.0.1",
+	"gpl.runtimeConsole.autoStartOnDebug": true,
+	"gpl.runtimeConsole.autoStartOnDeploy": true,
+	"gpl.controller.ftpFlashProjectsPath": "/flash/projects",
 	"gpl.trace.server": "verbose",
 	"gpl.controller.port": 1402,
 	"gpl.controller.consolePort": 1403,

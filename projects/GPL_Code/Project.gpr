@@ -4,24 +4,28 @@ ProjectName="GPL_Code"
 ProjectStart="ORCH_Main.MAIN"
 
 ' Core (동기화/자료구조/유틸/로깅)
-ProjectSource="Concurrency_SpinLock.gpl" ' VER 1.0.0
-ProjectSource="Core_RingQueue.gpl" ' VER 1.0.1
-ProjectSource="Observability_Logger.gpl" ' VER 1.0.12
-ProjectSource="Foundation_Utils.gpl" ' VER 1.0.3
-ProjectSource="Parsing_StringUtils.gpl" ' VER 1.0.1
+ProjectSource="Concurrency_SpinLock.gpl"
+ProjectSource="Core_RingQueue.gpl"
+ProjectSource="Observability_Logger.gpl"
+ProjectSource="Foundation_Utils.gpl"
+ProjectSource="Parsing_StringUtils.gpl"
 
 ' Data (파일I/O/직렬화/저장소)
-ProjectSource="Persistence_FileStore.gpl" ' VER 1.0.15
-ProjectSource="Format_Apon.gpl" ' VER 1.2.12
-ProjectSource="Pipeline_AsyncSave.gpl" ' VER 1.0.5
-ProjectSource="Format_DatStore.gpl" ' VER 1.0.5
+ProjectSource="Persistence_FileStore.gpl"
+ProjectSource="Format_Apon.gpl"
+ProjectSource="Pipeline_AsyncSave.gpl"
 
 ' Networking (TCP 통신)
-ProjectSource="TcpCmdQueue.gpl" ' VER 1.0.2
-ProjectSource="Debug_Telemetry.gpl" ' VER 1.0.2
-ProjectSource="Networking_TcpServer.gpl" ' VER 1.0.11
+ProjectSource="TcpCmdQueue.gpl"
+ProjectSource="Debug_Telemetry.gpl"
+ProjectSource="Networking_TcpProtocol.gpl"
+ProjectSource="Networking_TcpServer.gpl"
+ProjectSource="Networking_TcpClient.gpl"
+
+' Robot (로봇 제어 - Joint Only / Kinematic Module #1)
+ProjectSource="Robotics_Robot.gpl"
 
 ' Main (최상위, 마지막)
-ProjectSource="Orchestration_Main.gpl" ' VER 1.1.19
+ProjectSource="Orchestration_Main.gpl"
 ProjectEnd
 

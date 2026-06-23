@@ -1,30 +1,35 @@
 'Created: 2026/04/20
 'Adapted: GPL_Code architecture
-'Purpose: TCP 서버 인프라 통합 모듈
+'Purpose: TCP 서버 전송 계층 통합 모듈
 ' - TcpSession: 연결(슬롯)별 상태 캡슐화
 ' - Socket I/O: 수신/송신 경로의 예외 처리/디버그/락 정책
-' - Command Handler: TCP 수신 라인(명령) 파싱/처리 결정
 ' - Server Loop: accept/session/receive/line dispatch
 ' - TcpServer: 포트별 서버 객체 (생성자 자동 시작) + command pump + thread-per-connection 동시 다중 접속
+' - 명령 프로토콜(라인 파싱/처리 결정)은 Module NPR(Networking_TcpProtocol.gpl)로 분리됨
 '
 'Requires:
 ' - Concurrency_SpinLock.gpl        (Module SNC): SpinLock 클래스
 ' - TcpCmdQueue.gpl                 (Module NCQ): 채널 큐 관리, TcpCommandQueueChannel
+' - Networking_TcpProtocol.gpl      (Module NPR): EvaluateLine (수신 라인 처리 결정)
 ' - Parsing_StringUtils.gpl         (Module PRS): SplitOnce/SafeTrim
 ' - Observability_Logger.gpl        (Module LOG): 로그/예외 기록, LogSinkSub Delegate
-' - Foundation_Utils.gpl            (Module FND): CRLF, timeString
+' - Foundation_Utils.gpl            (Module FND): CRLF
 'Used by:
 ' - Orchestration_Main (Module ORCH_Main): NET.TcpServer 인스턴스 생성 (포트별)
 '
 ' 사용 예 (Orchestration_Main 등 엔트리 포인트에서):
 '   Dim s4000 As New NET.TcpServer(4000)   ' 생성자에서 listen + command pump 자동 시작
-'   (선택) s4000.SetCommandHandler(AddressOf MyModule.OnTcpCommand)
-Module NET ' Networking_TcpServer VER 1.0.11
+'   (선택) s4000.SetCommandHandler(New TcpCommandHandlerSub(AddressOf MyModule.OnTcpCommand))
+Module NET ' Networking_TcpServer VER 1.0.15
 
 	' TCP 명령 핸들러 Delegate (외부 모듈 확장 포인트)
-	' SetCommandHandler로 등록하면 command pump가 수신 라인마다 호출한다.
+	' SetCommandHandler로 등록하면 command pump가 비동기 명령마다 호출한다.
+	' - serverIndex: 포트 슬롯(채널) 인덱스
+	' - connId     : 발신 클라이언트 연결 인덱스. 결과는 NET.ReplyLineToConn(connId, ...)로 회신.
+	' - port       : listen 포트 문자열
+	' - line       : 적재된 명령 원문 라인
 	' 미등록 시 기본 동작은 RX 로그 출력.
-	Public Delegate Sub TcpCommandHandlerSub(ByVal serverIndex As Integer, ByVal port As String, ByVal line As String)
+	Public Delegate Sub TcpCommandHandlerSub(ByVal serverIndex As Integer, ByVal connId As Integer, ByVal port As String, ByVal line As String)
 
 
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -47,7 +52,10 @@ Module NET ' Networking_TcpServer VER 1.0.11
 		Private m_sendLock As New SpinLock
 		Private m_echoMode As Boolean
 		Private m_queue As TcpCommandQueueChannel
-		
+		' 연결 식별자: clientSessions[] 슬롯 인덱스(=connId). 발신 연결로의 회신 라우팅에 사용.
+		' (m_id는 포트 슬롯이라 연결을 구분하지 못한다.) 미설정 시 -1.
+		Private m_connId As Integer
+
 		
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		'''''''''''''''''''''' CONSTRUCTOR ''''''''''''''''''''''''''
@@ -57,8 +65,10 @@ Module NET ' Networking_TcpServer VER 1.0.11
 			m_id = id
 			m_ip = ip
 			m_port = port
-			m_echoMode = True
+			' 에코 기본 OFF: 명령 채널은 깔끔하게. 라인 미러링이 필요하면 ECHO 1로 켠다.
+			m_echoMode = False
 			m_queue = Nothing
+			m_connId = -1
 		End Sub
 		
 		
@@ -134,7 +144,17 @@ Module NET ' Networking_TcpServer VER 1.0.11
 				m_queue = value
 			End Set
 		End Property
-		
+
+		' 발신 연결 식별자 (clientSessions[] 슬롯 인덱스). 회신 라우팅용.
+		Public Property ConnId As Integer
+			Get
+				ConnId = m_connId
+			End Get
+			Set(value As Integer)
+				m_connId = value
+			End Set
+		End Property
+
 		
 		'''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 		'''''''''''''''''''''''' SEND '''''''''''''''''''''''''''''''
@@ -188,36 +208,31 @@ Module NET ' Networking_TcpServer VER 1.0.11
 		ret = 0
 		
 		If clientSocket Is Nothing Then
-			TryReceiveOnce = -1
-			Exit Function
+			Return -1
 		End If
-		
+
 		Try
 			ret = clientSocket.Receive(buf, timeoutMs)
 			If stopping <> 0 Then
-				TryReceiveOnce = -1
-				Exit Function
+				Return -1
 			End If
 			If ret < 0 Then
-				TryReceiveOnce = -1
-				Exit Function
+				Return -1
 			End If
 			If ret = 0 Then
-				TryReceiveOnce = 0
-				Exit Function
+				Return 0
 			End If
 			If debugOn = 1 Then
 				LOG.cehLog("Received | Len: " & CStr(ret), logContext)
 			End If
-			TryReceiveOnce = 1
+			Return 1
 		Catch ex
 			' stop 과정에서 socket close로 인한 예외는 정상 종료로 간주
 			If stopping <> 0 Then
-				TryReceiveOnce = -1
-				Exit Function
+				Return -1
 			End If
 			LOG.cehLogEx(ex, logContext & " - Receive failed")
-			TryReceiveOnce = -2
+			Return -2
 		End Try
 	End Function
 	
@@ -238,120 +253,10 @@ Module NET ' Networking_TcpServer VER 1.0.11
 	End Sub
 	
 	
-	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-	''''''''''''''''''''''' Command Handler ''''''''''''''''''''''''
-	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
-	
-	' TCP 수신 라인(명령) 파싱/처리 결정 로직
-	' - 네트워크/소켓 계층과 분리해 가독성/테스트 용이성 개선
-	' - 실제 송신과 큐 적재는 Server Loop 에서 수행
-	
-	' EvaluateLine: TCP 수신 line 1개를 파싱하고 처리 action 결정
-	' Input:
-	'  - line       : 수신된 명령 라인(raw)
-	'  - debugOn    : 디버그 로그 출력 여부 (1=on, 0=off)
-	'  - echoMode   : 에코 모드 상태 (ByRef, ECHO 명령으로 변경 가능)
-	' Output (ByRef):
-	'  - shouldEnqueue/enqueueText : 큐 적재 여부(1=yes, 0=no) 및 내용
-	'  - shouldEcho/echoText       : 에코 응답 여부(1=yes, 0=no) 및 내용
-	'  - replyLine1/replyLine2     : 즉시 응답 라인(최대 2개)
-	Public Sub EvaluateLine(ByVal line As String, ByVal debugOn As Integer, ByRef echoMode As Boolean, ByRef shouldEnqueue As Integer, ByRef enqueueText As String, ByRef shouldEcho As Integer, ByRef echoText As String, ByRef replyLine1 As String, ByRef replyLine2 As String)
-		Dim cmd As String
-		Dim args As String
-		Dim argsUpper As String
-		Dim left As String
-		Dim right As String
-		Dim splitOk As Integer
-		
-		' defaults
-		shouldEnqueue = 0
-		enqueueText = ""
-		shouldEcho = 0
-		echoText = ""
-		replyLine1 = ""
-		replyLine2 = ""
-		
-		If line Is Nothing Then line = ""
-		
-		' cmd/args 파싱 (첫 공백 기준)
-		splitOk = PRS.SplitOnce(line, " ", left, right)
-		If splitOk = 1 Then
-			cmd = PRS.SafeTrim(left)
-			args = PRS.SafeTrim(right)
-		Else
-			cmd = PRS.SafeTrim(line)
-			args = ""
-		End If
-		
-		' cmd는 비교용으로 대문자 정규화
-		cmd = PRS.SafeTrim(cmd)
-		If cmd <> "" Then
-			cmd = cmd.ToUpper()
-		End If
-		
-		' args 대문자 버전 (비교용)
-		argsUpper = PRS.SafeTrim(args)
-		If argsUpper <> "" Then
-			argsUpper = argsUpper.ToUpper()
-		End If
-		
-		If debugOn = 1 Then
-			LOG.cehLog("Command | " & cmd & " | Args: " & args, "NET.EvaluateLine")
-		End If
-		
-		' === Built-in commands (즉시 처리, 큐 미사용) ===
-		If cmd = "PING" Then
-			replyLine1 = "PONG"
-			Exit Sub
-		ElseIf cmd = "HELP" Then
-			replyLine1 = "OK CMDS: PING, HELP, ECHO 0|1, QUEUE <text>"
-			Exit Sub
-		ElseIf cmd = "ECHO" Then
-			If argsUpper = "1" Or argsUpper = "ON" Then
-				echoMode = True
-				replyLine1 = "OK ECHO=1"
-			ElseIf argsUpper = "0" Or argsUpper = "OFF" Then
-				echoMode = False
-				replyLine1 = "OK ECHO=0"
-			Else
-				replyLine1 = "ERR ECHO expects 0|1"
-			End If
-			Exit Sub
-		ElseIf cmd = "QUEUE" Then
-			shouldEnqueue = 1
-			enqueueText = args
-			replyLine1 = "OK QUEUED"
-			Exit Sub
-		End If
-		
-		' === Extension hook ===
-		If TryHandleCustom(cmd, args, argsUpper, line, debugOn, echoMode, shouldEnqueue, enqueueText, shouldEcho, echoText, replyLine1, replyLine2) = 1 Then
-			Exit Sub
-		End If
-		
-		' === Default 처리: 모든 미인식 명령은 큐 적재 후 ACK ===
-		If echoMode Then
-			shouldEcho = 1
-			echoText = FND.timeString() & " " & line
-		End If
-		
-		shouldEnqueue = 1
-		enqueueText = line
-		replyLine1 = "OK QUEUED"
-	End Sub
-	
-	' TryHandleCustom: 커스텀 명령 처리 훅
-	' Return: 1=handled, 0=not handled (기본 처리로 진행)
-	' DBG 모듈의 TCP 명령(DBG:SNAP / DBG:WATCH / DBG:CLEAR / DBG:VERBOSE / DBG:STATUS)을 라우팅한다.
-	Public Function TryHandleCustom(ByVal cmd As String, ByVal args As String, ByVal argsUpper As String, ByVal rawLine As String, ByVal debugOn As Integer, ByRef echoMode As Boolean, ByRef shouldEnqueue As Integer, ByRef enqueueText As String, ByRef shouldEcho As Integer, ByRef echoText As String, ByRef replyLine1 As String, ByRef replyLine2 As String) As Integer
-		If DBG.TryHandleCommand(cmd, args, argsUpper, replyLine1, replyLine2) = 1 Then
-			TryHandleCustom = 1
-			Exit Function
-		End If
-		TryHandleCustom = 0
-	End Function
-	
-	
+	' NOTE: TCP 명령 프로토콜(EvaluateLine/TryHandleCustom)은 전송 계층과 의존성이 없어
+	'       Module NPR(Networking_TcpProtocol.gpl)로 분리했다. 호출은 HandleCommandLine 참고.
+
+
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 	''''''''''''''''''''''''' Server Loop '''''''''''''''''''''''''''
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
@@ -411,16 +316,16 @@ Module NET ' Networking_TcpServer VER 1.0.11
 	' client pending 상태가 될 때까지 대기하거나, stopping 요청 시 종료한다.
 	' Return: 1=continue, 0=stop
 	Private Function WaitUntilPending(ByVal listener As TcpListener, ByVal stopping As Integer) As Integer
-		WaitUntilPending = 0
 		While Not listener.Pending()
 			If stopping <> 0 Then
-				Exit Function
+				Return 0
 			End If
 			Thread.Sleep(100)
 		End While
 		If stopping = 0 Then
-			WaitUntilPending = 1
+			Return 1
 		End If
+		Return 0
 	End Function
 	
 	' client socket 1개를 accept 시도한다.
@@ -429,10 +334,10 @@ Module NET ' Networking_TcpServer VER 1.0.11
 		Dim ex As Exception
 		Try
 			clientSocket = listener.AcceptSocket
-			TryAcceptSocket = 1
+			Return 1
 		Catch ex
 			LOG.cehLogEx(ex, "NET.TryAcceptSocket")
-			TryAcceptSocket = 0
+			Return 0
 		End Try
 	End Function
 	
@@ -447,7 +352,8 @@ Module NET ' Networking_TcpServer VER 1.0.11
 		
 		LOG.cehLog("Client connected", "NET.HandleClientSession")
 		Thread.Sleep(200)
-		session.SendLine(FND.timeString() & " start(" & Thread.CurrentThread.Name & ")")
+		' 접속 배너: 시간/스레드명 등 부가정보 없이 준비 신호만. (명령 채널 노이즈 제거)
+		session.SendLine("OK READY")
 		
 		ReceiveLoop(session, clientSocket, stopping, debugOn)
 		
@@ -514,17 +420,22 @@ Module NET ' Networking_TcpServer VER 1.0.11
 		If session Is Nothing Then Exit Sub
 		
 		localEchoMode = session.EchoMode
-		EvaluateLine(line, debugOn, localEchoMode, shouldEnqueue, enqueueText, shouldEcho, echoText, reply1, reply2)
+		NPR.EvaluateLine(line, debugOn, localEchoMode, shouldEnqueue, enqueueText, shouldEcho, echoText, reply1, reply2)
 		session.EchoMode = localEchoMode
 		
 		If shouldEcho = 1 Then
 			session.SendLine(echoText)
 		End If
 		If shouldEnqueue = 1 Then
+			' 봉투(envelope): "connId:원문" 형태로 발신 연결을 함께 적재한다.
+			' connId는 항상 숫자라 pump 측 첫 ':' 분할이 명령 본문의 ':'와 충돌하지 않는다.
+			' 큐 채널은 포트 단위(session.Id)이므로 connId가 없으면 발신 연결 회신이 불가능하다.
+			Dim envelope As String
+			envelope = CStr(session.ConnId) & ":" & enqueueText
 			If session.Queue Is Nothing Then
-				NCQ.Enqueue(session.Id, enqueueText)
+				NCQ.Enqueue(session.Id, envelope)
 			Else
-				session.Queue.Enqueue(enqueueText)
+				session.Queue.Enqueue(envelope)
 			End If
 		End If
 		If reply1 <> "" Then
@@ -658,8 +569,7 @@ Module NET ' Networking_TcpServer VER 1.0.11
 			listenThread.Argument = index
 			listenThread.Start
 
-			' 포트별 command pump 스레드 시작
-			StartPump(index)
+			' command pump는 전체 포트 공용 단일 스레드 (EnsureInfra에서 1회 시작)
 
 			LOG.cehLog("TcpServer listening | :" & portText & " | Index=" & CStr(index), "TcpServer.New")
 		End Sub
@@ -671,12 +581,12 @@ Module NET ' Networking_TcpServer VER 1.0.11
 		
 		' 현재 listen 중인 서버(포트) 수.
 		Public Shared Function GetConnectionCount() As Integer
-			GetConnectionCount = TcpCount
+			Return TcpCount
 		End Function
 
 		' 현재 접속 중인 클라이언트 연결 수 (동시 다중 접속).
 		Public Shared Function GetActiveClientCount() As Integer
-			GetActiveClientCount = activeClientCount
+			Return activeClientCount
 		End Function
 
 		Public Shared Sub SetDebug(ByVal enable As Integer)
@@ -695,6 +605,36 @@ Module NET ' Networking_TcpServer VER 1.0.11
 
 		Public Shared Sub ReplyLine(ByVal sourceIndex As Integer, ByVal line As String)
 			SendToClients(sourceIndex, line, 1)
+		End Sub
+
+		' ReplyToConn/ReplyLineToConn: 발신 연결(connId) 1개에만 회신한다.
+		' - 비동기 command pump 핸들러가 결과를 명령을 보낸 그 연결로만 돌려줄 때 사용.
+		' - 같은 포트의 다른 클라이언트에는 전달되지 않는다(Reply/ReplyLine은 포트 전체 브로드캐스트).
+		Public Shared Sub ReplyToConn(ByVal connId As Integer, ByVal data As String)
+			SendToConn(connId, data, 0)
+		End Sub
+
+		Public Shared Sub ReplyLineToConn(ByVal connId As Integer, ByVal line As String)
+			SendToConn(connId, line, 1)
+		End Sub
+
+		' connId(클라이언트 연결 슬롯) 1개에만 송신 (sendAsLine=1이면 CRLF 부가).
+		Private Shared Sub SendToConn(ByVal connId As Integer, ByVal data As String, ByVal sendAsLine As Integer)
+			Dim session As TcpSession
+			Dim ex As Exception
+			If data Is Nothing Then Exit Sub
+			If data = "" Then Exit Sub
+			If stopping <> 0 Then Exit Sub
+			If TryGetClientSessionByIndex(connId, session) = 0 Then Exit Sub
+			Try
+				If sendAsLine = 1 Then
+					session.SendLine(data)
+				Else
+					session.Send(data)
+				End If
+			Catch ex
+				LOG.cehLogEx(ex, "TcpServer.SendToConn")
+			End Try
 		End Sub
 
 		Public Shared Sub StopAll()
@@ -762,7 +702,7 @@ Module NET ' Networking_TcpServer VER 1.0.11
 
 		' 이 서버의 listen 포트.
 		Public Function Port() As Integer
-			Port = m_port
+			Return m_port
 		End Function
 
 		' 수신 명령 핸들러 등록 (선택, 인스턴스별). 미등록 시 pump는 RX 로그만 남긴다.
@@ -773,13 +713,15 @@ Module NET ' Networking_TcpServer VER 1.0.11
 		' serverIndex의 listen 포트 문자열 조회 (세션 레지스트리 기반).
 		Public Shared Function GetServerPort(ByVal serverIndex As Integer) As String
 			Dim session As TcpSession
-			GetServerPort = ""
-			If TryGetSessionByIndex(serverIndex, session) = 0 Then Exit Function
-			If session.Port Is Nothing Then Exit Function
-			GetServerPort = session.Port
+			If TryGetSessionByIndex(serverIndex, session) = 0 Then Return ""
+			If session.Port Is Nothing Then Return ""
+			Return session.Port
 		End Function
 
-		' 인프라 1회 초기화: 큐 리셋 + 로그 sink 등록 (idempotent).
+		' 인프라 1회 초기화: 큐 리셋 + 로그 sink 등록 + command pump 시작 (idempotent).
+		' NOTE: 로그 sink는 등록만 하고 포워딩은 기본 OFF다(s_logForwardEnabled).
+		'       명령 채널에 내부 로그가 섞이지 않도록, 라이브 로그 스트리밍이 필요할 때만
+		'       NET.SetLogForwarding(1)로 켠다.
 		Private Shared Sub EnsureInfra()
 			Dim doInit As Integer
 			doInit = 0
@@ -792,6 +734,7 @@ Module NET ' Networking_TcpServer VER 1.0.11
 			If doInit = 1 Then
 				NCQ.ResetAll()
 				LOG.RegisterLogSink(New LogSinkSub(AddressOf ForwardLogLine))
+				StartCommandPump()
 			End If
 		End Sub
 
@@ -799,72 +742,93 @@ Module NET ' Networking_TcpServer VER 1.0.11
 		Private Shared Function IsPortListening(ByVal portText As String) As Integer
 			Dim i As Integer
 			Dim session As TcpSession
-			IsPortListening = 0
-			If portText Is Nothing Then Exit Function
-			If portText = "" Then Exit Function
+			If portText Is Nothing Then Return 0
+			If portText = "" Then Return 0
 			For i = 0 To TcpCount - 1
 				If TryGetSessionByIndex(i, session) = 1 Then
 					If session.Port = portText Then
-						IsPortListening = 1
-						Exit Function
+						Return 1
 					End If
 				End If
 			Next
+			Return 0
 		End Function
 
-		' 포트별 command pump 스레드 시작.
-		Private Shared Sub StartPump(ByVal serverIndex As Integer)
+		' 전체 포트 공용 단일 command pump 스레드 시작 (EnsureInfra에서 1회).
+		Private Shared Sub StartCommandPump()
 			Dim pumpThread As Thread
-			Dim portText As String
-			If serverIndex < 0 Then Exit Sub
-			portText = GetServerPort(serverIndex)
-			If portText = "" Then portText = CStr(serverIndex)
 			' Thread 생성: GPL Thread.New 규칙에 따라 "ClassName.MethodName" 형식
-			pumpThread = New Thread("TcpServer.TcpCommandPumpThreadFunc",,"TCPCMD" & portText)
-			pumpThread.Argument = serverIndex
+			pumpThread = New Thread("TcpServer.TcpCommandPumpThreadFunc",,"TCPCMD")
 			pumpThread.Start
-			LOG.cehLog("TCP command pump started | Server=" & CStr(serverIndex) & " | Port=" & portText, "NET.StartPump")
+			LOG.cehLog("TCP command pump started (shared, all ports)", "TcpServer.StartCommandPump")
 		End Sub
 
-		' Command pump 워커: 채널(serverIndex)에서 수신 라인을 꺼내 dispatch.
+		' Command pump 워커 (단일): 모든 포트 채널을 라운드로빈으로 소비해 dispatch.
 		' CRITICAL: 스레드 밖으로 예외가 전파되면 컨트롤러 런타임 다운 가능.
 		Public Shared Sub TcpCommandPumpThreadFunc()
 			Dim ex As Exception
-			Dim serverIndex As Integer
+			Dim sourceIndex As Integer
 			Dim line As String
 			Dim portText As String
 			Try
-				serverIndex = Thread.CurrentThread.Argument
-				portText = GetServerPort(serverIndex)
-				If portText = "" Then portText = "?"
 				While stopping = 0
 					line = ""
-					If NCQ.TryDequeueFor(serverIndex, line) = 1 Then
-						DispatchCommand(serverIndex, portText, line)
+					sourceIndex = -1
+					If NCQ.TryDequeue(sourceIndex, line) = 1 Then
+						portText = GetServerPort(sourceIndex)
+						If portText = "" Then portText = CStr(sourceIndex)
+						DispatchCommand(sourceIndex, portText, line)
 					Else
 						Thread.Sleep(100)
 					End If
 				End While
 			Catch ex
-				LOG.cehLogEx(ex, "NET.TcpCommandPumpThreadFunc")
+				LOG.cehLogEx(ex, "TcpServer.TcpCommandPumpThreadFunc")
 			End Try
 		End Sub
 
-		' 수신 명령 1건 처리: serverIndex별 등록 핸들러로 전달 (없으면 RX 로그).
-		Private Shared Sub DispatchCommand(ByVal serverIndex As Integer, ByVal portText As String, ByVal line As String)
+		' 수신 명령 1건 처리: 봉투("connId:원문")를 풀어 serverIndex별 등록 핸들러로 전달.
+		' 핸들러 미등록 시 RX 로그만 남긴다.
+		Private Shared Sub DispatchCommand(ByVal serverIndex As Integer, ByVal portText As String, ByVal envelope As String)
 			Dim ex As Exception
 			Dim handler As TcpCommandHandlerSub
+			Dim connId As Integer
+			Dim cmdLine As String
+			Dim sepLeft As String
+			Dim sepRight As String
+
+			' 봉투 분해: 첫 ':' 기준. connId는 숫자라 본문의 ':'와 충돌하지 않는다.
+			connId = -1
+			cmdLine = envelope
+			If envelope Is Nothing Then cmdLine = ""
+			If PRS.SplitOnce(cmdLine, ":", sepLeft, sepRight) = 1 Then
+				connId = ParseConnId(sepLeft)
+				cmdLine = sepRight
+			End If
+
 			handler = GetHandlerForIndex(serverIndex)
 			If handler Is Nothing Then
-				LOG.cehLog("TCP CMD RX | Server=" & CStr(serverIndex) & " | Port=" & portText & " | " & line, "TcpServer.Pump")
+				LOG.cehLog("TCP CMD RX | Server=" & CStr(serverIndex) & " | Conn=" & CStr(connId) & " | Port=" & portText & " | " & cmdLine, "TcpServer.Pump")
 				Exit Sub
 			End If
 			Try
-				handler(serverIndex, portText, line)
+				handler(serverIndex, connId, portText, cmdLine)
 			Catch ex
 				LOG.cehLogEx(ex, "TcpServer.DispatchCommand - handler failed")
 			End Try
 		End Sub
+
+		' 봉투 connId 파싱: 비숫자/공백이면 -1 (방어적). 발신 연결 미상으로 처리된다.
+		Private Shared Function ParseConnId(ByVal s As String) As Integer
+			Dim ex As Exception
+			s = PRS.SafeTrim(s)
+			If s = "" Then Return -1
+			Try
+				ParseConnId = CInt(s)
+			Catch ex
+				ParseConnId = -1
+			End Try
+		End Function
 
 		' serverIndex(슬롯)별 핸들러 저장 (인스턴스 SetCommandHandler에서 호출).
 		Private Shared Sub SetHandlerForIndex(ByVal slotIndex As Integer, ByVal handler As TcpCommandHandlerSub)
@@ -881,15 +845,18 @@ Module NET ' Networking_TcpServer VER 1.0.11
 
 		' serverIndex(슬롯)별 핸들러 조회 (없으면 Nothing).
 		Private Shared Function GetHandlerForIndex(ByVal slotIndex As Integer) As TcpCommandHandlerSub
-			GetHandlerForIndex = Nothing
-			If slotIndex < 0 Then Exit Function
+			Dim handler As TcpCommandHandlerSub
+			handler = Nothing
+			' NOTE: 락 해제(ReleaseInitLock) 전에 Return하면 락 누수/데드락 → 지역변수에 담아 해제 후 반환
+			If slotIndex < 0 Then Return Nothing
 			AcquireInitLock()
 			If Not s_handlers Is Nothing Then
 				If slotIndex < s_handlers.Length Then
-					GetHandlerForIndex = s_handlers(slotIndex)
+					handler = s_handlers(slotIndex)
 				End If
 			End If
 			ReleaseInitLock()
+			Return handler
 		End Function
 
 
@@ -1022,8 +989,7 @@ Module NET ' Networking_TcpServer VER 1.0.11
 			If TcpCount >= maxChannels Then
 				ReleaseInitLock()
 				LOG.cehLog("Too many connections (max=" & CStr(maxChannels) & ")", "TcpServer.AllocateSlot")
-				AllocateSlot = -1
-				Exit Function
+				Return -1
 			End If
 			slotIndex = TcpCount
 			TcpCount += 1
@@ -1036,18 +1002,17 @@ Module NET ' Networking_TcpServer VER 1.0.11
 			
 			sessions(slotIndex) = session
 			ReleaseInitLock()
-			
-			AllocateSlot = slotIndex
+
+			Return slotIndex
 		End Function
 		
 		Private Shared Function TryGetSessionByIndex(ByVal slotIndex As Integer, ByRef session As TcpSession) As Integer
 			Dim ok As Integer
 			session = Nothing
 			If slotIndex < 0 Then
-				TryGetSessionByIndex = 0
-				Exit Function
+				Return 0
 			End If
-			
+
 			ok = 1
 			AcquireInitLock()
 			If sessions Is Nothing Then
@@ -1058,17 +1023,16 @@ Module NET ' Networking_TcpServer VER 1.0.11
 				session = sessions(slotIndex)
 			End If
 			ReleaseInitLock()
-			
+
 			If ok = 0 Then
 				session = Nothing
-				TryGetSessionByIndex = 0
-				Exit Function
+				Return 0
 			End If
-			
+
 			If session Is Nothing Then
-				TryGetSessionByIndex = 0
+				Return 0
 			Else
-				TryGetSessionByIndex = 1
+				Return 1
 			End If
 		End Function
 
@@ -1079,9 +1043,8 @@ Module NET ' Networking_TcpServer VER 1.0.11
 			Dim clientIndex As Integer
 			Dim i As Integer
 			Dim clientSession As TcpSession
-			RegisterClientSession = -1
-			If serverSession Is Nothing Then Exit Function
-			If clientSocket Is Nothing Then Exit Function
+			If serverSession Is Nothing Then Return -1
+			If clientSocket Is Nothing Then Return -1
 
 			AcquireInitLock()
 			clientIndex = -1
@@ -1105,12 +1068,14 @@ Module NET ' Networking_TcpServer VER 1.0.11
 
 			clientSession = New TcpSession(serverSession.Id, serverSession.Ip, serverSession.Port)
 			clientSession.Queue = serverSession.Queue
+			' connId = clientSessions[] 슬롯. pump가 이 연결로만 회신할 수 있게 세션에 기록.
+			clientSession.ConnId = clientIndex
 			clientSession.AttachSocket(clientSocket)
 			clientSessions(clientIndex) = clientSession
 			activeClientCount += 1
 			ReleaseInitLock()
 
-			RegisterClientSession = clientIndex
+			Return clientIndex
 		End Function
 
 		' 클라이언트 연결 세션 해제 (슬롯 재사용 가능 상태로). 연결 종료 시 호출.
@@ -1135,8 +1100,7 @@ Module NET ' Networking_TcpServer VER 1.0.11
 			Dim ok As Integer
 			session = Nothing
 			If clientIndex < 0 Then
-				TryGetClientSessionByIndex = 0
-				Exit Function
+				Return 0
 			End If
 
 			ok = 1
@@ -1152,14 +1116,13 @@ Module NET ' Networking_TcpServer VER 1.0.11
 
 			If ok = 0 Then
 				session = Nothing
-				TryGetClientSessionByIndex = 0
-				Exit Function
+				Return 0
 			End If
 
 			If session Is Nothing Then
-				TryGetClientSessionByIndex = 0
+				Return 0
 			Else
-				TryGetClientSessionByIndex = 1
+				Return 1
 			End If
 		End Function
 
@@ -1170,12 +1133,28 @@ Module NET ' Networking_TcpServer VER 1.0.11
 	'''''''''''''''''''''''' Log Sink '''''''''''''''''''''''''''''''
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 	
-	' LOG.RegisterLogSink(AddressOf NET.ForwardLogLine)으로 등록하면
-	' LOG.EmitLogLine에서 이 함수를 호출해 모든 TCP 세션에 로그를 포워딩한다.
+	' 라이브 로그 스트리밍 on/off (기본 OFF). EnsureInfra에서 sink는 등록되지만
+	' 이 플래그가 0이면 ForwardLogLine은 즉시 반환해 명령 채널을 깔끔하게 유지한다.
+	Private Dim s_logForwardEnabled As Integer
+
+	' 접속 클라이언트로의 내부 로그 포워딩(스트리밍)을 켜고 끈다.
+	' - 0(기본): 명령 채널에 내부 로그 미포함.
+	' - 1: 모든 활성 TCP 세션으로 로그 라인을 브로드캐스트(디버깅/모니터링용).
+	Public Sub SetLogForwarding(ByVal enable As Integer)
+		If enable <> 0 Then
+			s_logForwardEnabled = 1
+		Else
+			s_logForwardEnabled = 0
+		End If
+	End Sub
+
+	' LOG.RegisterLogSink(AddressOf NET.ForwardLogLine)으로 등록되며,
+	' s_logForwardEnabled=1일 때만 LOG.EmitLogLine이 모든 TCP 세션으로 로그를 포워딩한다.
 	Public Sub ForwardLogLine(line As String)
+		If s_logForwardEnabled = 0 Then Exit Sub
 		If line Is Nothing Then line = ""
 		TcpServer.BroadcastLine(line)
 	End Sub
-	
+
 End Module
 

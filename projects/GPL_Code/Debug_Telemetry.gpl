@@ -11,7 +11,7 @@
 ' - Foundation_Utils.gpl      (Module FND): timeString
 ' - Parsing_StringUtils.gpl   (Module PRS): StartsWith, SplitOnce, SafeTrim
 'Used by:
-' - Networking_TcpServer (Module NET): TryHandleCustom → TryHandleCommand
+' - Networking_TcpProtocol (Module NPR): TryHandleCustom → TryHandleCommand
 ' - Orchestration_Main: DBG.SetEnabled(1) 기동 시 활성화
 '
 ' TCP 명령 사용 예 (telnet / 확장 터미널에서):
@@ -20,7 +20,7 @@
 '   DBG:CLEAR            → Watch + Span 전체 초기화
 '   DBG:VERBOSE 1        → 상세 로그 ON
 '   DBG:STATUS           → 모듈 활성화/Watch 수/Span 수 출력
-Module DBG ' Debug_Telemetry VER 1.0.3
+Module DBG ' Debug_Telemetry VER 1.0.4
 
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 	'''''''''''''''''''''''' CONSTANTS '''''''''''''''''''''''''''''
@@ -271,7 +271,7 @@ Module DBG ' Debug_Telemetry VER 1.0.3
 	'''''''''''''''' TCP COMMAND ROUTING (via NET) ''''''''''''''''''
 	''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''''
 
-	' NET.TryHandleCustom에서 호출한다.
+	' NPR.TryHandleCustom에서 호출한다.
 	' cmd/args/argsUpper: EvaluateLine에서 전달된 정규화 값
 	' replyLine1/replyLine2: TCP 응답 (ByRef)
 	' Return: 1=handled, 0=not handled

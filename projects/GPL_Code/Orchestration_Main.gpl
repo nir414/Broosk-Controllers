@@ -9,8 +9,9 @@
 'Updated: 2026/06/02 (TCP 서버 호출 형식을 포트 단건 호출로 단순화)
 'Updated: 2026/06/02 (TCP 멀티포트/펌프/레지스트리 책임을 NET 파사드로 이전, ORCH는 초기화+시작만)
 'Updated: 2026/06/02 (TCP 서버를 포트별 NET.TcpServer 객체 생성 방식으로 변경)
-'Updated: 2026/06/02 (ApnSmokeTest 추가: APON section 4 동작 + GetDblArray 검증)
-Module ORCH_Main ' ORCH_Main VER 1.1.19
+'Updated: 2026/06/02 (비동기 명령 경로 데모 ASYNC 등록 + 연결별 회신 핸들러 추가)
+'Updated: 2026/06/23 (SetCommandHandler에 명시적 New TcpCommandHandlerSub(AddressOf ...) 적용 → -205 컴파일 오류 해결)
+Module ORCH_Main ' ORCH_Main VER 1.1.22
 
 	' ============================================================
 	' MAIN: 운영 기본 초기화
@@ -20,16 +21,23 @@ Module ORCH_Main ' ORCH_Main VER 1.1.19
 		Try
 			LOG.cehLog("Runtime initialized", "MAIN")
 			InitializeRuntime()
-			
-			' APON 스모크 테스트
-			ApnSmokeTest()
 
 			' TCP 명령 서버: 포트별 객체 생성 시 listen + command pump 자동 시작.
 			' (멀티포트/펌프/세션 관리 상세는 NET.TcpServer 내부가 담당)
-			Dim s4000 As New TcpServer(4000)
-			Dim s4001 As New TcpServer(4001)
-			Dim s4002 As New TcpServer(4002)
-			Dim s4003 As New TcpServer(4003)
+			Dim S4000 As New TcpServer(4000)
+			Dim S4001 As New TcpServer(4001)
+			Dim S4002 As New TcpServer(4002)
+			Dim S4003 As New TcpServer(4003)
+
+			' === 비동기 명령 경로 데모 (검증용, 운영 명령 도입 시 교체/제거) ===
+			' 클라이언트가 "ASYNC <text>"를 보내면 즉시 "OK QUEUED ASYNC" ACK를 받고,
+			' command pump 스레드가 OnTcpAsyncDemo를 호출해 발신 연결로만 결과를 회신한다.
+			' 같은 포트의 다른 클라이언트에는 결과가 가지 않는다(연결별 라우팅 검증).
+			NPR.RegisterAsyncCommand("ASYNC")
+			S4000.SetCommandHandler(New TcpCommandHandlerSub(AddressOf OnTcpAsyncDemo))
+			S4001.SetCommandHandler(New TcpCommandHandlerSub(AddressOf OnTcpAsyncDemo))
+			S4002.SetCommandHandler(New TcpCommandHandlerSub(AddressOf OnTcpAsyncDemo))
+			S4003.SetCommandHandler(New TcpCommandHandlerSub(AddressOf OnTcpAsyncDemo))
 
 		Catch ex
 			LOG.cehLogEx(ex, "ORCH_Main.MAIN")
@@ -44,95 +52,12 @@ Module ORCH_Main ' ORCH_Main VER 1.1.19
 		PST.CleanupTempFiles()
 	End Sub
 
-	' ============================================================
-	' APON 스모크 테스트: APON 공식 "4. Using APON" 동작 + GetDblArray 검증
-	' (DatStore 대체 가능성 확인용. 검증 후 제거 가능)
-	' return: 실패한 검증 개수 (0 = 전체 PASS)
-	' ============================================================
-	Public Function ApnSmokeTest() As Integer
-		Dim fails As Integer
-		Dim ex As Exception
-		fails = 0
-		Try
-			' [1] section 4: 컴팩트 루트 읽기 (콤마 구분, 공백 포함 값)
-			Dim f As AponFile = New AponFile()
-			f.LoadFromString("name: John Doe, age: 30")
-			fails = fails + AssertStr("read.name", f.root.GetString("name", "?"), "John Doe")
-			fails = fails + AssertInt("read.age", f.root.GetInt("age", -1), 30)
-
-			' [2] 블록 체인 + 숫자 배열 쓰기 → 직렬화 → 재파싱 라운드트립
-			Dim vals(2) As String
-			vals(0) = "1.5"
-			vals(1) = "2.25"
-			vals(2) = "3"
-			f.root.Block("server").SetString("host", "192.168.0.10")
-			f.root.SetArray("points", vals, 3)
-
-			Dim s As String
-			s = f.BuildString()
-			LOG.cehLog("[ApnTest] PRETTY:" & FND.CRLF & s, "ApnTest")
-
-			Dim g As AponFile = New AponFile()
-			g.LoadFromString(s)
-			fails = fails + AssertStr("rt.host", g.root.GetChild("server").GetString("host", "?"), "192.168.0.10")
-
-			' [3] GetDblArray: 숫자 배열을 Double() 버퍼로 변환 (DatStore 파리티)
-			Dim d() As Double
-			Dim n As Integer
-			n = g.root.GetDblArray("points", d)
-			fails = fails + AssertInt("arr.count", n, 3)
-			If n = 3 Then
-				fails = fails + AssertDbl("arr[0]", d(0), 1.5)
-				fails = fails + AssertDbl("arr[1]", d(1), 2.25)
-				fails = fails + AssertDbl("arr[2]", d(2), 3.0)
-			Else
-				fails = fails + 1
-			End If
-
-			If fails = 0 Then
-				LOG.cehLog("[ApnTest] ALL PASS", "ApnTest")
-			Else
-				LOG.cehLog("[ApnTest] FAILED checks=" & CStr(fails), "ApnTest")
-			End If
-		Catch ex
-			LOG.cehLogEx(ex, "ORCH_Main.ApnSmokeTest")
-			fails = fails + 1
-		End Try
-		Return fails
-	End Function
-
-	' 검증 헬퍼: 일치 시 0, 불일치 시 1 반환 + 로그
-	Private Function AssertStr(label As String, actual As String, expected As String) As Integer
-		If actual = expected Then
-			LOG.cehLog("[ApnTest] PASS " & label & " = [" & actual & "]", "ApnTest")
-			Return 0
-		End If
-		LOG.cehLog("[ApnTest] FAIL " & label & " | actual=[" & actual & "] expected=[" & expected & "]", "ApnTest")
-		Return 1
-	End Function
-
-	Private Function AssertInt(label As String, actual As Integer, expected As Integer) As Integer
-		If actual = expected Then
-			LOG.cehLog("[ApnTest] PASS " & label & " = " & CStr(actual), "ApnTest")
-			Return 0
-		End If
-		LOG.cehLog("[ApnTest] FAIL " & label & " | actual=" & CStr(actual) & " expected=" & CStr(expected), "ApnTest")
-		Return 1
-	End Function
-
-	' 부동소수 비교는 허용 오차 사용 (직렬화 소수 3자리 반올림 고려)
-	Private Function AssertDbl(label As String, actual As Double, expected As Double) As Integer
-		Dim diff As Double
-		diff = actual - expected
-		If diff < 0 Then
-			diff = -diff
-		End If
-		If diff <= 0.0005 Then
-			LOG.cehLog("[ApnTest] PASS " & label & " = " & CStr(actual), "ApnTest")
-			Return 0
-		End If
-		LOG.cehLog("[ApnTest] FAIL " & label & " | actual=" & CStr(actual) & " expected=" & CStr(expected), "ApnTest")
-		Return 1
-	End Function
+	' 비동기 명령 데모 핸들러 (검증용): command pump 스레드에서 호출된다.
+	' connId(발신 연결)로만 결과를 회신해 연결별 라우팅이 동작함을 확인한다.
+	' 운영 도메인 명령이 생기면 이 핸들러를 실제 처리로 교체한다.
+	Public Sub OnTcpAsyncDemo(ByVal serverIndex As Integer, ByVal connId As Integer, ByVal port As String, ByVal line As String)
+		LOG.cehLog("ASYNC handling | conn=" & CStr(connId) & " | port=" & port & " | " & line, "ORCH_Main.OnTcpAsyncDemo")
+		TcpServer.ReplyLineToConn(connId, "ASYNC DONE conn=" & CStr(connId) & " :" & line)
+	End Sub
 End Module
 

@@ -1,5 +1,5 @@
 ' GPL String Utilities Module
-' 
+'
 ' 설계 원칙:
 ' - Split 남발 금지 (할당 많아서 느림)
 ' - IndexOf/Substring 중심으로 처리
@@ -7,7 +7,7 @@
 ' - Substring 범위 검사 필수 (SafeSubstring)
 ' - 공백/주석 처리 유틸로 파싱 코드 간결화
 
-Module PRS ' Parsing_StringUtils VER 1.0.1
+Module PRS ' Parsing_StringUtils VER 1.0.2
 
 	' ========================================
 	' [0] Internal helpers (Nothing-safe)
@@ -16,9 +16,9 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 	' 따라서 문자열 입력은 먼저 정규화(= Nothing -> "") 후 처리한다.
 	Private Function NormalizeString(s As String) As String
 		If s Is Nothing Then
-			NormalizeString = ""
+			Return ""
 		Else
-			NormalizeString = s
+			Return s
 		End If
 	End Function
 
@@ -30,37 +30,34 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 	Public Function SplitOnce(line As String, sep As String, _
 	                          ByRef left As String, ByRef right As String) As Integer
 		Dim pos As Integer
-		
+
 		line = NormalizeString(line)
 		sep = NormalizeString(sep)
 		If line = "" Then
 			left = ""
 			right = ""
-			SplitOnce = 0
-			Exit Function
+			Return 0
 		End If
 		If sep = "" Then
 			left = ""
 			right = ""
-			SplitOnce = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		' 첫 구분자 위치 찾기
 		pos = line.IndexOf(sep)
-		
+
 		If pos < 0 Then
 			' 구분자 없음
 			left = ""
 			right = ""
-			SplitOnce = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		' 구분자 전/후 분리
 		left = line.Substring(0, pos)
 		right = line.Substring(pos + Len(sep))
-		SplitOnce = 1
+		Return 1
 	End Function
 
 	' ========================================
@@ -70,9 +67,9 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 	Public Function SafeTrim(s As String) As String
 		s = NormalizeString(s)
 		If s = "" Then
-			SafeTrim = ""
+			Return ""
 		Else
-			SafeTrim = s.Trim()
+			Return s.Trim()
 		End If
 	End Function
 
@@ -98,36 +95,34 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 	                                ByRef value As String) As Integer
 		Dim trimmed As String
 		Dim firstChar As String
-		
+
 		' 1단계: 공백 제거
 		trimmed = SafeTrim(line)
-		
+
 		' 2단계: 빈 줄 체크
 		If trimmed = "" Then
 			key = ""
 			value = ""
-			ParseConfigLine = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		' 3단계: 주석 체크 (';' 또는 '#')
 		firstChar = Mid(trimmed, 1, 1)
 		If firstChar = ";" Or firstChar = "#" Then
 			key = ""
 			value = ""
-			ParseConfigLine = 2
-			Exit Function
+			Return 2
 		End If
-		
+
 		' 4단계: 키=값 분리
 		If SplitOnce(trimmed, "=", key, value) = 1 Then
 			key = SafeTrim(key)
 			value = SafeTrim(value)
-			ParseConfigLine = 1
+			Return 1
 		Else
 			key = ""
 			value = ""
-			ParseConfigLine = 0
+			Return 0
 		End If
 	End Function
 
@@ -141,23 +136,22 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		Dim tokens() As String
 		Dim i As Integer
 		Dim ex As New Exception
-		
+
 		data = NormalizeString(data)
 		If data = "" Then
-			Parse1DArray = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		Try
 			' 1단계: Split
 			tokens = data.Split(",")
-			
+
 			' 2단계: 모두 Trim
 			TrimAll(tokens)
-			
+
 			' 3단계: Double 변환 및 배열 재할당
 			ReDim outVal(tokens.Length - 1)
-			
+
 			For i = 0 To tokens.Length - 1
 				If tokens(i) <> "" Then
 					outVal(i) = CDbl(tokens(i))
@@ -165,11 +159,11 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 					outVal(i) = 0.0
 				End If
 			Next
-			
-			Parse1DArray = tokens.Length
+
+			Return tokens.Length
 		Catch ex
 			cehLogEx(ex, "Parse1DArray")
-			Parse1DArray = 0
+			Return 0
 		End Try
 	End Function
 
@@ -190,20 +184,19 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		Dim validRows As Integer
 		Dim rowIndex As Integer
 		Dim ex As New Exception
-		
+
 		data = NormalizeString(data)
 		If data = "" Then
 			rows = 0
 			cols = 0
-			Parse2DArray = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		Try
 			' 1단계: 행 분리 ('|' 파이프로 구분)
 			rowTokens = data.Split("|")
 			TrimAll(rowTokens)
-			
+
 			' 2단계: 유효 행(빈 줄/주석 제외) 개수와 열 개수 계산
 			validRows = 0
 			cols = 0
@@ -221,18 +214,17 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 					End If
 				End If
 			Next
-			
+
 			If validRows = 0 Or cols = 0 Then
 				rows = 0
 				cols = 0
-				Parse2DArray = 0
-				Exit Function
+				Return 0
 			End If
 			rows = validRows
-			
+
 			' 3단계: 2D 배열 할당 (1D로 관리)
 			ReDim outVal(rows * cols - 1)
-			
+
 			' 4단계: 2중 루프로 Double 변환 (주석/빈행 무시)
 			rowIndex = 0
 			For i = 0 To rowTokens.Length - 1
@@ -241,7 +233,7 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 					If StartsWith(trimmedRow, ";") = 0 And StartsWith(trimmedRow, "#") = 0 Then
 						colTokens = trimmedRow.Split(",")
 						TrimAll(colTokens)
-						
+
 						For j = 0 To cols - 1
 							If j < colTokens.Length And colTokens(j) <> "" Then
 								outVal(rowIndex * cols + j) = CDbl(colTokens(j))
@@ -253,13 +245,13 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 					End If
 				End If
 			Next
-			
-			Parse2DArray = 1
+
+			Return 1
 		Catch ex
 			cehLogEx(ex, "Parse2DArray")
 			rows = 0
 			cols = 0
-			Parse2DArray = 0
+			Return 0
 		End Try
 	End Function
 
@@ -271,26 +263,24 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		Dim actualStart As Integer
 		Dim actualLength As Integer
 		Dim maxAvailable As Integer
-		
+
 		s = NormalizeString(s)
 		If s = "" Then
-			SafeSubstring = ""
-			Exit Function
+			Return ""
 		End If
-		
+
 		' start 조정
 		If start < 0 Then
 			actualStart = 0
 		Else
 			actualStart = start
 		End If
-		
+
 		' 범위 초과 체크
 		If actualStart >= Len(s) Then
-			SafeSubstring = ""
-			Exit Function
+			Return ""
 		End If
-		
+
 		' length 조정
 		maxAvailable = Len(s) - actualStart
 		If length > maxAvailable Then
@@ -298,12 +288,12 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		Else
 			actualLength = length
 		End If
-		
+
 		' 최종 추출
 		If actualLength <= 0 Then
-			SafeSubstring = ""
+			Return ""
 		Else
-			SafeSubstring = s.Substring(actualStart, actualLength)
+			Return s.Substring(actualStart, actualLength)
 		End If
 	End Function
 
@@ -315,23 +305,20 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		s = NormalizeString(s)
 		prefix = NormalizeString(prefix)
 		If s = "" Then
-			StartsWith = 0
-			Exit Function
+			Return 0
 		End If
 		If prefix = "" Then
-			StartsWith = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		If Len(s) < Len(prefix) Then
-			StartsWith = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		If s.Substring(0, Len(prefix)) = prefix Then
-			StartsWith = 1
+			Return 1
 		Else
-			StartsWith = 0
+			Return 0
 		End If
 	End Function
 
@@ -341,28 +328,25 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 	' 용도: 접미사 체크
 	Public Function EndsWith(s As String, suffix As String) As Integer
 		Dim startPos As Integer
-		
+
 		s = NormalizeString(s)
 		suffix = NormalizeString(suffix)
 		If s = "" Then
-			EndsWith = 0
-			Exit Function
+			Return 0
 		End If
 		If suffix = "" Then
-			EndsWith = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		If Len(s) < Len(suffix) Then
-			EndsWith = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		startPos = Len(s) - Len(suffix)
 		If s.Substring(startPos) = suffix Then
-			EndsWith = 1
+			Return 1
 		Else
-			EndsWith = 0
+			Return 0
 		End If
 	End Function
 
@@ -376,35 +360,33 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		Dim pos As Integer
 		Dim minPos As Integer
 		Dim currentChar As String
-		
+
 		s = NormalizeString(s)
 		chars = NormalizeString(chars)
 		If s = "" Then
-			IndexOfAny = -1
-			Exit Function
+			Return -1
 		End If
 		If chars = "" Then
-			IndexOfAny = -1
-			Exit Function
+			Return -1
 		End If
-		
+
 		minPos = Len(s)  ' 최대값으로 초기화
-		
+
 		' 각 문자마다 IndexOf 수행
 		For i = 1 To Len(chars)
 			currentChar = Mid(chars, i, 1)
 			pos = s.IndexOf(currentChar)
-			
+
 			' 유효한 위치 중 최소값 찾기
 			If pos >= 0 And pos < minPos Then
 				minPos = pos
 			End If
 		Next
-		
+
 		If minPos = Len(s) Then
-			IndexOfAny = -1  ' 없음
+			Return -1  ' 없음
 		Else
-			IndexOfAny = minPos
+			Return minPos
 		End If
 	End Function
 
@@ -414,24 +396,22 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 	' 용도: 간단한 치환 (첫 번째만, 모두 등)
 	Public Function ReplaceFirst(s As String, oldVal As String, newVal As String) As String
 		Dim pos As Integer
-		
+
 		s = NormalizeString(s)
 		oldVal = NormalizeString(oldVal)
 		newVal = NormalizeString(newVal)
 		If s = "" Then
-			ReplaceFirst = s
-			Exit Function
+			Return s
 		End If
 		If oldVal = "" Then
-			ReplaceFirst = s
-			Exit Function
+			Return s
 		End If
-		
+
 		pos = s.IndexOf(oldVal)
 		If pos < 0 Then
-			ReplaceFirst = s
+			Return s
 		Else
-			ReplaceFirst = s.Substring(0, pos) & newVal & s.Substring(pos + Len(oldVal))
+			Return s.Substring(0, pos) & newVal & s.Substring(pos + Len(oldVal))
 		End If
 	End Function
 
@@ -443,27 +423,25 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		Dim parts() As String
 		Dim result As String
 		Dim i As Integer
-		
+
 		s = NormalizeString(s)
 		oldVal = NormalizeString(oldVal)
 		newVal = NormalizeString(newVal)
 		If s = "" Then
-			ReplaceAll = s
-			Exit Function
+			Return s
 		End If
 		If oldVal = "" Then
-			ReplaceAll = s
-			Exit Function
+			Return s
 		End If
-		
+
 		parts = s.Split(oldVal)
 		result = parts(0)
-		
+
 		For i = 1 To parts.Length - 1
 			result = result & newVal & parts(i)
 		Next
-		
-		ReplaceAll = result
+
+		Return result
 	End Function
 
 	' ========================================
@@ -473,18 +451,16 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		s = NormalizeString(s)
 		substring = NormalizeString(substring)
 		If s = "" Then
-			Contains = 0
-			Exit Function
+			Return 0
 		End If
 		If substring = "" Then
-			Contains = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		If s.IndexOf(substring) >= 0 Then
-			Contains = 1
+			Return 1
 		Else
-			Contains = 0
+			Return 0
 		End If
 	End Function
 
@@ -494,26 +470,24 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 	Public Function CountChar(s As String, ch As String) As Integer
 		Dim count As Integer
 		Dim i As Integer
-		
+
 		s = NormalizeString(s)
 		ch = NormalizeString(ch)
 		If s = "" Then
-			CountChar = 0
-			Exit Function
+			Return 0
 		End If
 		If ch = "" Then
-			CountChar = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		count = 0
 		For i = 1 To Len(s)
 			If Mid(s, i, 1) = ch Then
 				count = count + 1
 			End If
 		Next
-		
-		CountChar = count
+
+		Return count
 	End Function
 
 	' ========================================
@@ -555,7 +529,7 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 	' ========================================
 	' 용도: [1,2,3] 또는 [[1,2],[3,4]] 같은 JSON 배열을 1D 선형 배열로 변환
 	' 반환: 파싱된 요소 개수 (실패 시 0)
-	' 
+	'
 	' 최적화:
 	' - Pass 1: 요소 개수만 세기 (ReDim 크기 결정)
 	' - Pass 2: 배열 할당 후 값 입력 (ReDim 1번만)
@@ -570,43 +544,40 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		Dim trimmed As String
 		Dim count As Integer
 		Dim ex As New Exception
-		
+
 		jsonStr = NormalizeString(jsonStr)
 		If jsonStr = "" Then
-			ParseJsonArray = 0
-			Exit Function
+			Return 0
 		End If
-		
+
 		Try
 			trimmed = SafeTrim(jsonStr)
-			
+
 			' 시작이 '[' 확인
 			If Mid(trimmed, 1, 1) <> "[" Then
-				ParseJsonArray = 0
-				Exit Function
+				Return 0
 			End If
-			
+
 			' Pass 1: 요소 개수 세기
 			count = CountJsonElements(trimmed)
-			
+
 			If count <= 0 Then
-				ParseJsonArray = 0
-				Exit Function
+				Return 0
 			End If
-			
+
 			' Pass 2: 배열 할당 후 값 입력
 			ReDim outVal(count - 1)
 			Dim pos As Integer
 			pos = 1
 			Dim filledCount As Integer
 			filledCount = 0
-			
+
 			ExtractJsonValues(trimmed, pos, outVal, filledCount)
-			
-			ParseJsonArray = filledCount
+
+			Return filledCount
 		Catch ex
 			cehLogEx(ex, "ParseJsonArray")
-			ParseJsonArray = 0
+			Return 0
 		End Try
 	End Function
 
@@ -616,13 +587,13 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		Dim ch As String
 		Dim count As Integer
 		Dim inNumber As Integer
-		
+
 		count = 0
 		inNumber = 0
-		
+
 		For i = 1 To Len(jsonStr)
 			ch = Mid(jsonStr, i, 1)
-			
+
 			If (ch >= "0" And ch <= "9") Or (ch = "-" And inNumber = 0) Then
 				' 새 숫자 시작 또는 숫자 내부 유지
 				If inNumber = 0 Then
@@ -635,8 +606,8 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 				inNumber = 0
 			End If
 		Next
-		
-		CountJsonElements = count
+
+		Return count
 	End Function
 
 	' Pass 2: JSON 배열에서 값을 순서대로 추출
@@ -647,11 +618,11 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 		Dim ch As String
 		Dim numStr As String
 		Dim ex As New Exception
-		
+
 		Try
 			While pos <= Len(jsonStr)
 				ch = Mid(jsonStr, pos, 1)
-				
+
 				' 분기 (Select Case 미사용: GPL 구문 호환성 확보)
 				If ch = "[" Then
 					' BEGIN nested array
@@ -680,7 +651,7 @@ Module PRS ' Parsing_StringUtils VER 1.0.1
 								Exit While
 							End If
 						End While
-						
+
 						If numStr <> "" And numStr <> "-" Then
 							If count < outVal.Length Then
 								outVal(count) = CDbl(numStr)
